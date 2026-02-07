@@ -801,6 +801,26 @@ query_bgp_he_net() {
     fi
 }
 
+fallback_asn_from_cymru() {
+    local ip_file="$1"
+    local out_file="$2"
+    : > "$out_file"
+    [[ ! -f "$ip_file" ]] && return 0
+
+    # Team Cymru keyless ASN lookup fallback
+    {
+        echo "begin"
+        echo "verbose"
+        cat "$ip_file"
+        echo "end"
+    } | whois -h whois.cymru.com 2>/dev/null \
+        | awk -F'|' 'NR>1 {
+            gsub(/[[:space:]]/, "", $1)
+            if ($1 ~ /^[0-9]+$/) print "AS" $1
+        }' \
+        | sort -u > "$out_file" 2>/dev/null || true
+}
+
 phase3_asn_discovery() {
     phase_banner "3" "ASN DISCOVERY & IP ENUMERATION"
 
@@ -938,6 +958,13 @@ phase3_asn_discovery() {
     sort -u -o "${ASN_DIR}/unique_asns.txt" "${ASN_DIR}/unique_asns.txt"
     sort -u -o "${ASN_DIR}/trusted_asns.txt" "${ASN_DIR}/trusted_asns.txt"
     sort -u -o "${ASN_DIR}/asn_info.txt" "${ASN_DIR}/asn_info.txt"
+
+    # If asnmap produced nothing (e.g., PDCP prompt/no auth), fall back to Team Cymru whois
+    if [[ $(count_lines "${ASN_DIR}/unique_asns.txt") -eq 0 ]]; then
+        print_warning "asnmap returned no ASN data. Falling back to whois.cymru.com ASN lookup..."
+        fallback_asn_from_cymru "$ip_file" "${ASN_DIR}/unique_asns.txt"
+        cp "${ASN_DIR}/unique_asns.txt" "${ASN_DIR}/trusted_asns.txt" 2>/dev/null || true
+    fi
 
     local trusted_asn_count
     trusted_asn_count=$(count_lines "${ASN_DIR}/trusted_asns.txt")
