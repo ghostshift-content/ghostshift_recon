@@ -312,6 +312,13 @@ check_tools() {
     fi
 
     print_success "All required tools verified"
+    if ! httpx -h 2>&1 | grep -q -- "-status-code"; then
+        print_error "Detected non-ProjectDiscovery httpx binary. Install PD httpx:"
+        echo "  go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"
+        return 1
+    fi
+    print_status "Verified ProjectDiscovery httpx capabilities (-status-code supported)"
+
     if [[ ${#missing_optional[@]} -gt 0 ]]; then
         print_warning "Optional tools missing: ${missing_optional[*]} - coverage may be reduced"
     fi
@@ -659,11 +666,11 @@ phase1_subdomain_enumeration() {
 }
 
 # ============================================================================
-# PHASE 2: DNS RESOLUTION & LIVE HOST DETECTION
+# PHASE 2: DNS RESOLUTION
 # ============================================================================
 
 phase2_dns_and_livehost() {
-    phase_banner "2" "DNS RESOLUTION & LIVE HOST DETECTION"
+    phase_banner "2" "DNS RESOLUTION"
 
     mkdir -p "$DNS_DIR"
 
@@ -758,39 +765,13 @@ phase2_dns_and_livehost() {
     ip_count=$(count_lines "${DNS_DIR}/resolved_ips.txt")
     print_status "Extracted ${ip_count} unique IP addresses (numerically sorted)"
 
-    # --- Live Host Detection with httpx ---
-    print_progress "Probing for live HTTP/HTTPS services with httpx..."
-
-    httpx -l "${OUTPUT_DIR}/resolved_hosts.txt" \
-        -silent \
-        -threads "$DEFAULT_HTTPX_THREADS" \
-        -status-code \
-        -title \
-        -tech-detect \
-        -content-length \
-        -follow-redirects \
-        -timeout 10 \
-        -retries 2 \
-        -o "${DNS_DIR}/httpx_results.txt" \
-        2>>"$LOG_FILE" || true
-
-    # Extract live host URLs
-    if [[ -f "${DNS_DIR}/httpx_results.txt" ]]; then
-        awk '{print $1}' "${DNS_DIR}/httpx_results.txt" \
-            | sort -u > "${OUTPUT_DIR}/live_hosts.txt"
-        cp "${DNS_DIR}/httpx_results.txt" "${OUTPUT_DIR}/live_hosts_full.txt"
-    else
-        touch "${OUTPUT_DIR}/live_hosts.txt"
-        touch "${OUTPUT_DIR}/live_hosts_full.txt"
-    fi
-
-    local live_count
-    live_count=$(count_lines "${OUTPUT_DIR}/live_hosts.txt")
+    # httpx now runs later in dedicated Phase 4C after all target gathering
+    touch "${OUTPUT_DIR}/live_hosts.txt"
+    touch "${OUTPUT_DIR}/live_hosts_full.txt"
 
     echo ""
-    print_success "Phase 2 Complete: ${resolved_count} resolved, ${live_count} live hosts"
-    print_finding "Live hosts: ${OUTPUT_DIR}/live_hosts.txt"
-    print_finding "Full httpx output: ${OUTPUT_DIR}/live_hosts_full.txt"
+    print_success "Phase 2 Complete: ${resolved_count} resolved hosts, ${ip_count} unique IPs"
+    print_status "HTTP probing deferred to Phase 4C (final consolidated httpx run)"
 }
 
 # ============================================================================
@@ -1047,56 +1028,16 @@ phase3_asn_discovery() {
 
     print_status "Total IPs from ASN expansion: ${total_ips}"
 
-    # --- Run httpx on ASN-discovered IPs ---
-    # Find IPs that weren't already covered by Phase 2's subdomain probing
-    print_progress "Probing ASN-discovered IPs with httpx for live services..."
-
-    local asn_new_ips="${ASN_DIR}/asn_new_ips.txt"
-    if [[ -f "${DNS_DIR}/resolved_ips.txt" ]]; then
-        comm -23 \
-            <(sort -u "${OUTPUT_DIR}/asn_ips.txt") \
-            <(sort -u "${DNS_DIR}/resolved_ips.txt") \
-            > "$asn_new_ips" 2>/dev/null || touch "$asn_new_ips"
-    else
-        cp "${OUTPUT_DIR}/asn_ips.txt" "$asn_new_ips"
-    fi
-
-    local new_ip_count
-    new_ip_count=$(count_lines "$asn_new_ips")
-
-    if [[ "$new_ip_count" -gt 0 ]]; then
-        print_status "  ${new_ip_count} IPs not yet probed — running httpx..."
-
-        httpx -l "$asn_new_ips" \
-            -silent \
-            -threads "$DEFAULT_HTTPX_THREADS" \
-            -status-code \
-            -title \
-            -tech-detect \
-            -content-length \
-            -follow-redirects \
-            -timeout 10 \
-            -retries 2 \
-            -o "${ASN_DIR}/httpx_asn_ips.txt" \
-            2>>"$LOG_FILE" || touch "${ASN_DIR}/httpx_asn_ips.txt"
-
-        local asn_live
-        asn_live=$(count_lines "${ASN_DIR}/httpx_asn_ips.txt")
-        print_status "  httpx found ${asn_live} live services on ASN IPs"
-
-        if [[ "$asn_live" -gt 0 ]]; then
-            awk '{print $1}' "${ASN_DIR}/httpx_asn_ips.txt" | sort -u > "${ASN_DIR}/asn_live_urls.txt"
-        fi
-    else
-        print_status "  All ASN IPs were already covered by Phase 2. Skipping."
-    fi
+    # httpx now runs once in Phase 4C after all discovery is complete
+    touch "${ASN_DIR}/httpx_asn_ips.txt"
+    touch "${ASN_DIR}/asn_live_urls.txt"
 
     echo ""
     print_success "Phase 3 Complete: ${total_cidrs} CIDRs, ${total_ips} IPs enumerated"
     print_finding "CIDR ranges: ${OUTPUT_DIR}/asn_cidrs.txt"
     print_finding "IP addresses: ${OUTPUT_DIR}/asn_ips.txt"
     print_finding "Trusted ASNs: ${ASN_DIR}/trusted_asns.txt"
-    print_finding "ASN IP httpx results: ${ASN_DIR}/httpx_asn_ips.txt"
+    print_status "HTTP probing deferred to Phase 4C (final consolidated httpx run)"
     print_finding "ASN info: ${ASN_DIR}/asn_info.txt"
 
     # Copy org names to output dir for Phase 4
@@ -1433,16 +1374,22 @@ phase4_ssl_validation() {
     fi
 
     : > "${SSL_DIR}/ssl_validated_ip_urls.txt"
-    if [[ -f "${ASN_DIR}/httpx_asn_ips.txt" ]] && [[ -f "${SSL_DIR}/ssl_validated_ips.txt" ]]; then
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            [[ -z "$line" ]] && continue
-            local url host_part
-            url=$(echo "$line" | awk '{print $1}')
-            host_part=$(extract_domain_from_url "$url")
-            if is_ip "$host_part" && grep -qx "$host_part" "${SSL_DIR}/ssl_validated_ips.txt" 2>/dev/null; then
+    if [[ -f "${SSL_DIR}/validated_hosts.txt" ]]; then
+        while IFS= read -r host || [[ -n "$host" ]]; do
+            [[ -z "$host" ]] && continue
+            local host_core url
+            if [[ "$host" == http* ]]; then
+                host_core=$(extract_domain_from_url "$host")
+                url="$host"
+            else
+                host_core=$(echo "$host" | sed 's/:.*$//')
+                url="https://${host}"
+            fi
+
+            if is_ip "$host_core"; then
                 echo "$url" >> "${SSL_DIR}/ssl_validated_ip_urls.txt"
             fi
-        done < "${ASN_DIR}/httpx_asn_ips.txt"
+        done < "${SSL_DIR}/validated_hosts.txt"
         sort -u -o "${SSL_DIR}/ssl_validated_ip_urls.txt" "${SSL_DIR}/ssl_validated_ip_urls.txt"
     fi
 
@@ -1687,68 +1634,11 @@ phase4b_rescan_ssl_discoveries() {
     fi
 
     # ─────────────────────────────────────────────────────────────────
-    # STEP 3: HTTP probing on new resolved hosts (Phase 2 re-run)
+    # STEP 3: HTTP probing is deferred to dedicated final Phase 4C
     # ─────────────────────────────────────────────────────────────────
     echo ""
-    echo -e "${BOLD}${WHITE}── Step 3: HTTP/HTTPS probing on new hosts ──${NC}"
-
-    # Only probe hosts not already in live_hosts
-    local unprobed="${SSL_DIR}/rescan_unprobed.txt"
-    if [[ -f "${SSL_DIR}/rescan_resolved.txt" ]]; then
-        if [[ -f "${OUTPUT_DIR}/live_hosts.txt" ]]; then
-            # Extract hostnames from live_hosts URLs for comparison
-            local existing_live_domains="${SSL_DIR}/existing_live_domains.txt"
-            sed -e 's|https\?://||' -e 's|/.*||' -e 's|:.*||' \
-                "${OUTPUT_DIR}/live_hosts.txt" \
-                | sort -u > "$existing_live_domains" 2>/dev/null || touch "$existing_live_domains"
-
-            comm -23 \
-                <(sort -u "${SSL_DIR}/rescan_resolved.txt") \
-                <(sort -u "$existing_live_domains") \
-                > "$unprobed" 2>/dev/null || touch "$unprobed"
-        else
-            cp "${SSL_DIR}/rescan_resolved.txt" "$unprobed"
-        fi
-    else
-        touch "$unprobed"
-    fi
-
-    local unprobed_count
-    unprobed_count=$(count_lines "$unprobed")
-
-    if [[ "$unprobed_count" -gt 0 ]]; then
-        print_progress "Probing ${unprobed_count} new hosts with httpx..."
-
-        httpx -l "$unprobed" \
-            -silent \
-            -threads "$DEFAULT_HTTPX_THREADS" \
-            -status-code \
-            -title \
-            -tech-detect \
-            -content-length \
-            -follow-redirects \
-            -timeout 10 \
-            -retries 2 \
-            -o "${SSL_DIR}/rescan_httpx.txt" \
-            2>>"$LOG_FILE" || touch "${SSL_DIR}/rescan_httpx.txt"
-
-        if [[ -f "${SSL_DIR}/rescan_httpx.txt" ]]; then
-            local new_live
-            new_live=$(count_lines "${SSL_DIR}/rescan_httpx.txt")
-            print_status "httpx found ${new_live} new live hosts"
-
-            # Extract URLs and merge into master live_hosts
-            awk '{print $1}' "${SSL_DIR}/rescan_httpx.txt" \
-                | sort -u >> "${OUTPUT_DIR}/live_hosts.txt"
-            sort -u -o "${OUTPUT_DIR}/live_hosts.txt" "${OUTPUT_DIR}/live_hosts.txt"
-
-            # Merge full httpx output
-            cat "${SSL_DIR}/rescan_httpx.txt" >> "${OUTPUT_DIR}/live_hosts_full.txt"
-            sort -u -o "${OUTPUT_DIR}/live_hosts_full.txt" "${OUTPUT_DIR}/live_hosts_full.txt"
-        fi
-    else
-        print_status "All new hosts were already probed. Skipping httpx."
-    fi
+    echo -e "${BOLD}${WHITE}── Step 3: HTTP/HTTPS probing deferred ──${NC}"
+    print_status "Phase 4C will run one consolidated httpx pass on final targets"
 
     # ─────────────────────────────────────────────────────────────────
     # Summary
@@ -1764,7 +1654,90 @@ phase4b_rescan_ssl_discoveries() {
     echo -e "  ${CYAN}Total resolved:${NC}       ${final_resolved}"
     echo -e "  ${CYAN}Total live hosts:${NC}     ${final_live}"
     echo ""
-    print_success "Phase 4B Complete: SSL feedback loop finished — all new subs resolved & probed"
+    print_success "Phase 4B Complete: SSL feedback loop finished — new subs resolved"
+}
+
+# ============================================================================
+# PHASE 4C: FINAL CONSOLIDATED HTTPX PROBING
+# ============================================================================
+
+phase4c_final_httpx_probe() {
+    phase_banner "4C" "FINAL CONSOLIDATED HTTPX PROBING"
+
+    mkdir -p "$DNS_DIR" "$ASN_DIR"
+
+    local targets_file="${DNS_DIR}/httpx_final_targets.txt"
+    : > "$targets_file"
+
+    # Final host/domain targets
+    if [[ -f "${OUTPUT_DIR}/resolved_hosts.txt" ]]; then
+        cat "${OUTPUT_DIR}/resolved_hosts.txt" >> "$targets_file"
+    fi
+
+    # Include ASN IP inventory discovered across phases
+    if [[ -f "${OUTPUT_DIR}/asn_ips.txt" ]]; then
+        cat "${OUTPUT_DIR}/asn_ips.txt" >> "$targets_file"
+    fi
+
+    # Include SSL validated host:port targets
+    if [[ -f "${SSL_DIR}/validated_hosts.txt" ]]; then
+        cat "${SSL_DIR}/validated_hosts.txt" >> "$targets_file"
+    fi
+
+    sort -u -o "$targets_file" "$targets_file"
+    delete_empty_lines "$targets_file"
+
+    local target_count
+    target_count=$(count_lines "$targets_file")
+    if [[ "$target_count" -eq 0 ]]; then
+        print_warning "No final targets available for httpx probing."
+        touch "${DNS_DIR}/httpx_results.txt"
+        touch "${OUTPUT_DIR}/live_hosts.txt"
+        touch "${OUTPUT_DIR}/live_hosts_full.txt"
+        touch "${ASN_DIR}/httpx_asn_ips.txt"
+        return
+    fi
+
+    print_progress "Running a single final httpx pass on ${target_count} targets..."
+    httpx -l "$targets_file" \
+        -silent \
+        -threads "$DEFAULT_HTTPX_THREADS" \
+        -status-code \
+        -title \
+        -tech-detect \
+        -content-length \
+        -follow-redirects \
+        -timeout 10 \
+        -retries 2 \
+        -o "${DNS_DIR}/httpx_results.txt" \
+        2>>"$LOG_FILE" || touch "${DNS_DIR}/httpx_results.txt"
+
+    if [[ -f "${DNS_DIR}/httpx_results.txt" ]]; then
+        awk '{print $1}' "${DNS_DIR}/httpx_results.txt" | sort -u > "${OUTPUT_DIR}/live_hosts.txt"
+        cp "${DNS_DIR}/httpx_results.txt" "${OUTPUT_DIR}/live_hosts_full.txt"
+    else
+        touch "${OUTPUT_DIR}/live_hosts.txt"
+        touch "${OUTPUT_DIR}/live_hosts_full.txt"
+    fi
+
+    # Keep ASN-IP-specific httpx slice for downstream compatibility/reporting
+    : > "${ASN_DIR}/httpx_asn_ips.txt"
+    if [[ -f "${OUTPUT_DIR}/asn_ips.txt" ]] && [[ -f "${DNS_DIR}/httpx_results.txt" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" ]] && continue
+            local url host_part
+            url=$(echo "$line" | awk '{print $1}')
+            host_part=$(extract_domain_from_url "$url")
+            if is_ip "$host_part" && grep -qx "$host_part" "${OUTPUT_DIR}/asn_ips.txt" 2>/dev/null; then
+                echo "$line" >> "${ASN_DIR}/httpx_asn_ips.txt"
+            fi
+        done < "${DNS_DIR}/httpx_results.txt"
+        sort -u -o "${ASN_DIR}/httpx_asn_ips.txt" "${ASN_DIR}/httpx_asn_ips.txt"
+    fi
+
+    print_success "Phase 4C Complete: final httpx probing finished"
+    print_finding "Live hosts: ${OUTPUT_DIR}/live_hosts.txt"
+    print_finding "Full httpx output: ${OUTPUT_DIR}/live_hosts_full.txt"
 }
 
 # ============================================================================
@@ -2053,12 +2026,14 @@ phase7_js_security_scan() {
     local s3_in_use="${JS_DIR}/js_s3_in_use.txt"
     local fetch_errors="${JS_DIR}/js_fetch_errors.txt"
     local tmp_dir="${JS_DIR}/tmp_js_fetch"
+    local origin_urls="${JS_DIR}/origin_urls_to_scan.txt"
 
     : > "$findings"
     : > "$s3_refs"
     : > "$s3_claimable"
     : > "$s3_in_use"
     : > "$fetch_errors"
+    : > "$origin_urls"
     mkdir -p "$tmp_dir"
 
     local processed=0
@@ -2103,6 +2078,54 @@ phase7_js_security_scan() {
             done
     done < "$js_useful"
 
+    # Also scan original target URLs (homepage/source) for inline hardcoded creds/S3 refs
+    while IFS= read -r domain || [[ -n "$domain" ]]; do
+        domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+        [[ -z "$domain" || "$domain" == \#* ]] && continue
+        echo "https://${domain}" >> "$origin_urls"
+        echo "https://www.${domain}" >> "$origin_urls"
+        echo "http://${domain}" >> "$origin_urls"
+    done < "$TARGET_FILE"
+    sort -u -o "$origin_urls" "$origin_urls"
+
+    local origin_processed=0
+    while IFS= read -r origin_url || [[ -n "$origin_url" ]]; do
+        [[ -z "$origin_url" ]] && continue
+        ((origin_processed++))
+
+        local origin_file
+        origin_file="${tmp_dir}/origin_${origin_processed}.txt"
+        if ! curl -sS -L --max-time 20 --connect-timeout 8 "$origin_url" -o "$origin_file" 2>>"$LOG_FILE"; then
+            echo "$origin_url" >> "$fetch_errors"
+            continue
+        fi
+
+        # High-confidence token patterns
+        grep -Eo 'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|ghp_[0-9A-Za-z]{36}|xox[baprs]-[0-9A-Za-z-]{10,80}' "$origin_file" 2>/dev/null \
+            | sort -u \
+            | while IFS= read -r token || [[ -n "$token" ]]; do
+                [[ -z "$token" ]] && continue
+                echo "[HIGH][ORIGIN] ${origin_url} | token=$(mask_secret_value "$token")" >> "$findings"
+            done
+
+        # Suspicious hardcoded key-value assignments (reduced-noise)
+        grep -Ein '(api[_-]?key|access[_-]?key|secret|token|password|passwd|client[_-]?secret)[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9_./+=:-]{12,120}["'"'"']' "$origin_file" 2>/dev/null \
+            | grep -Eiv 'example|sample|dummy|test|changeme|placeholder|your[_-]?key' \
+            | head -n 20 \
+            | while IFS= read -r match_line || [[ -n "$match_line" ]]; do
+                [[ -z "$match_line" ]] && continue
+                echo "[MEDIUM][ORIGIN] ${origin_url} | ${match_line}" >> "$findings"
+            done
+
+        # S3 endpoint extraction
+        grep -Eoi '([a-z0-9.-]+\.s3[.-][a-z0-9-]+\.amazonaws\.com|[a-z0-9.-]+\.s3\.amazonaws\.com|s3\.amazonaws\.com/[a-z0-9.-]+|[a-z0-9.-]+\.s3-website[.-][a-z0-9-]+\.amazonaws\.com)' "$origin_file" 2>/dev/null \
+            | sort -u \
+            | while IFS= read -r s3_ep || [[ -n "$s3_ep" ]]; do
+                [[ -z "$s3_ep" ]] && continue
+                echo -e "${s3_ep}\t${origin_url}" >> "$s3_refs"
+            done
+    done < "$origin_urls"
+
     sort -u -o "$findings" "$findings" 2>/dev/null || true
     sort -u -o "$s3_refs" "$s3_refs" 2>/dev/null || true
 
@@ -2135,6 +2158,7 @@ phase7_js_security_scan() {
     sort -u -o "$s3_in_use" "$s3_in_use" 2>/dev/null || true
 
     print_status "JS files fetched: $((processed < DEFAULT_JS_MAX_FILES ? processed : DEFAULT_JS_MAX_FILES))"
+    print_status "Origin URLs scanned: ${origin_processed}"
     print_status "Secret findings: $(count_lines "$findings")"
     print_status "S3 claimable candidates: $(count_lines "$s3_claimable")"
     print_status "S3 in-use endpoints: $(count_lines "$s3_in_use")"
@@ -2617,7 +2641,7 @@ usage() {
     echo "      --crawl-depth N      URL crawl depth for katana/hakrawler (default: ${DEFAULT_URL_CRAWL_DEPTH})"
     echo "  -p, --ports PORTS        Comma-separated ports for naabu (default: ${DEFAULT_PORTS})"
     echo "      --top-ports N        Use naabu top-ports mode instead of port list"
-    echo "      --phase N            Run only specific phase (1-8, or 4b for SSL re-scan)"
+    echo "      --phase N            Run only specific phase (1-8, or 4b/4c)"
     echo "      --skip-nuclei        Skip vulnerability scanning (Phase 5)"
     echo "      --nuclei-severity S  Nuclei severity filter (default: info,low,medium,high,critical)"
     echo "  -h, --help               Show this help message"
@@ -2627,6 +2651,7 @@ usage() {
     echo "  $0 -f targets.txt -o ./results -r 100"
     echo "  $0 -f targets.txt --phase 1"
     echo "  $0 -f targets.txt --phase 6"
+    echo "  $0 -f targets.txt --phase 4c"
     echo "  $0 -f targets.txt --enum-jobs 8 --crawl-depth 3"
     echo "  $0 -f targets.txt --skip-nuclei"
     echo "  $0 -f targets.txt --top-ports 1000"
@@ -2804,12 +2829,13 @@ main() {
             3)  phase3_asn_discovery ;;
             4)  phase4_ssl_validation ;;
             4b|4B) phase4b_rescan_ssl_discoveries ;;
+            4c|4C) phase4c_final_httpx_probe ;;
             5)  phase5_vulnerability_scan ;;
             6)  phase6_js_discovery ;;
             7)  phase7_js_security_scan ;;
             8)  phase8_cache_poisoning_safe ;;
             *)
-                echo -e "${CROSS} Invalid phase: ${SPECIFIC_PHASE}. Use 1-8 or 4b."
+                echo -e "${CROSS} Invalid phase: ${SPECIFIC_PHASE}. Use 1-8 or 4b/4c."
                 exit 1
                 ;;
         esac
@@ -2819,6 +2845,7 @@ main() {
         phase3_asn_discovery
         phase4_ssl_validation
         phase4b_rescan_ssl_discoveries
+        phase4c_final_httpx_probe
 
         if [[ "$SKIP_NUCLEI" == false ]]; then
             phase5_vulnerability_scan
