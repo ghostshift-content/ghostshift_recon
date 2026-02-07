@@ -821,6 +821,15 @@ fallback_asn_from_cymru() {
         | sort -u > "$out_file" 2>/dev/null || true
 }
 
+has_pdcp_key() {
+    local key="${PDCP_API_KEY:-}"
+    # Basic guard: non-empty and not placeholder-style value
+    if [[ -n "$key" ]] && [[ "$key" != *"<"* ]] && [[ "$key" != *">"* ]]; then
+        return 0
+    fi
+    return 1
+}
+
 phase3_asn_discovery() {
     phase_banner "3" "ASN DISCOVERY & IP ENUMERATION"
 
@@ -865,17 +874,26 @@ phase3_asn_discovery() {
 
     : > "${ASN_DIR}/asnmap_results_raw.txt"
     : > "${ASN_DIR}/asnmap_json_raw.jsonl"
+    local asnmap_json_enabled=false
+    if has_pdcp_key; then
+        asnmap_json_enabled=true
+    else
+        print_warning "PDCP API key not detected/invalid format. ASN JSON enrichment will be skipped."
+    fi
+
     if [[ "$ip_count" -gt 0 ]]; then
         safe_timeout 60s asnmap -i "$ip_file" \
             -silent \
             2>>"$LOG_FILE" \
-            | sort -u >> "${ASN_DIR}/asnmap_results_raw.txt" || true
+            | grep -Ev '^\[\*\] Enter PDCP API Key' >> "${ASN_DIR}/asnmap_results_raw.txt" || true
 
-        safe_timeout 60s asnmap -i "$ip_file" \
-            -json \
-            -silent \
-            2>>"$LOG_FILE" \
-            >> "${ASN_DIR}/asnmap_json_raw.jsonl" || true
+        if [[ "$asnmap_json_enabled" == true ]]; then
+            safe_timeout 60s asnmap -i "$ip_file" \
+                -json \
+                -silent \
+                2>>"$LOG_FILE" \
+                | grep -E '^\{' >> "${ASN_DIR}/asnmap_json_raw.jsonl" || true
+        fi
     fi
 
     # Also map root domains directly
@@ -883,8 +901,12 @@ phase3_asn_discovery() {
         while IFS= read -r domain || [[ -n "$domain" ]]; do
             domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
             [[ -z "$domain" || "$domain" == \#* ]] && continue
-            safe_timeout 60s asnmap -d "$domain" -silent 2>>"$LOG_FILE" >> "${ASN_DIR}/asnmap_results_raw.txt" || true
-            safe_timeout 60s asnmap -d "$domain" -json -silent 2>>"$LOG_FILE" >> "${ASN_DIR}/asnmap_json_raw.jsonl" || true
+            safe_timeout 60s asnmap -d "$domain" -silent 2>>"$LOG_FILE" \
+                | grep -Ev '^\[\*\] Enter PDCP API Key' >> "${ASN_DIR}/asnmap_results_raw.txt" || true
+            if [[ "$asnmap_json_enabled" == true ]]; then
+                safe_timeout 60s asnmap -d "$domain" -json -silent 2>>"$LOG_FILE" \
+                    | grep -E '^\{' >> "${ASN_DIR}/asnmap_json_raw.jsonl" || true
+            fi
         done < "$TARGET_FILE"
     fi
     sort -u -o "${ASN_DIR}/asnmap_results_raw.txt" "${ASN_DIR}/asnmap_results_raw.txt"
