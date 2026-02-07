@@ -312,12 +312,16 @@ check_tools() {
     fi
 
     print_success "All required tools verified"
-    if ! httpx -h 2>&1 | grep -q -- "-status-code"; then
+    local httpx_help httpx_ver
+    httpx_help="$(httpx -h 2>&1 || true)"
+    httpx_ver="$(httpx -version 2>&1 || true)"
+    if ! echo "$httpx_help" | grep -Eq -- 'projectdiscovery|-sc([[:space:]]|,)|-status-code' \
+       && ! echo "$httpx_ver" | grep -qi 'projectdiscovery'; then
         print_error "Detected non-ProjectDiscovery httpx binary. Install PD httpx:"
         echo "  go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"
         return 1
     fi
-    print_status "Verified ProjectDiscovery httpx capabilities (-status-code supported)"
+    print_status "Verified ProjectDiscovery httpx binary"
 
     if [[ ${#missing_optional[@]} -gt 0 ]]; then
         print_warning "Optional tools missing: ${missing_optional[*]} - coverage may be reduced"
