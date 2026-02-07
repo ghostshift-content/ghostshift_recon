@@ -1,0 +1,7 @@
+# GhostShift Recon - Example Target File
+# One root domain per line. Lines starting with # are comments.
+#
+# Usage: ./recon.sh -f targets_example.txt
+#
+# Replace these with your authorized target domains:
+example.com

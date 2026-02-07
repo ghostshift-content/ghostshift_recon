@@ -1,0 +1,25 @@
+# Recon output directories
+recon_results_*/
+
+# Target files (may contain sensitive scope info)
+targets.txt
+current_scan.txt
+
+# API keys and configs
+.env
+*.key
+provider-config.yaml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Logs (keep in output dirs, not root)
+*.log
