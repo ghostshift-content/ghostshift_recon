@@ -841,7 +841,13 @@ phase3_asn_discovery() {
                 2>>"$LOG_FILE" \
                 | sort -u > "$ip_file" || touch "$ip_file"
         else
-            touch "$ip_file"
+            print_warning "No subdomains file available. Attempting IP extraction from root targets..."
+            dnsx -l "$TARGET_FILE" \
+                -a -resp-only \
+                -silent \
+                -t "$DEFAULT_DNSX_THREADS" \
+                2>>"$LOG_FILE" \
+                | sort -u > "$ip_file" || touch "$ip_file"
         fi
     fi
 
@@ -849,36 +855,36 @@ phase3_asn_discovery() {
     ip_count=$(count_lines "$ip_file")
 
     if [[ "$ip_count" -eq 0 ]]; then
-        print_warning "No IPs to perform ASN discovery. Skipping Phase 3."
-        touch "${OUTPUT_DIR}/asn_cidrs.txt"
-        touch "${OUTPUT_DIR}/asn_ips.txt"
-        touch "${ASN_DIR}/asn_info.txt"
-        return
+        print_warning "No IPs available. Continuing with domain-based ASN discovery..."
     fi
 
-    print_status "Processing ${ip_count} IPs for ASN mapping..."
+    print_status "Processing ${ip_count} IPs for ASN mapping (if available)..."
 
     # --- ASN Mapping with asnmap ---
     print_progress "Running asnmap to discover ASN ownership..."
 
-    asnmap -i "$ip_file" \
-        -silent \
-        2>>"$LOG_FILE" \
-        | sort -u > "${ASN_DIR}/asnmap_results_raw.txt" || touch "${ASN_DIR}/asnmap_results_raw.txt"
+    : > "${ASN_DIR}/asnmap_results_raw.txt"
+    : > "${ASN_DIR}/asnmap_json_raw.jsonl"
+    if [[ "$ip_count" -gt 0 ]]; then
+        safe_timeout 60s asnmap -i "$ip_file" \
+            -silent \
+            2>>"$LOG_FILE" \
+            | sort -u >> "${ASN_DIR}/asnmap_results_raw.txt" || true
 
-    asnmap -i "$ip_file" \
-        -json \
-        -silent \
-        2>>"$LOG_FILE" \
-        > "${ASN_DIR}/asnmap_json_raw.jsonl" || touch "${ASN_DIR}/asnmap_json_raw.jsonl"
+        safe_timeout 60s asnmap -i "$ip_file" \
+            -json \
+            -silent \
+            2>>"$LOG_FILE" \
+            >> "${ASN_DIR}/asnmap_json_raw.jsonl" || true
+    fi
 
     # Also map root domains directly
     if [[ -f "$TARGET_FILE" ]]; then
         while IFS= read -r domain || [[ -n "$domain" ]]; do
             domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
             [[ -z "$domain" || "$domain" == \#* ]] && continue
-            asnmap -d "$domain" -silent 2>>"$LOG_FILE" >> "${ASN_DIR}/asnmap_results_raw.txt" || true
-            asnmap -d "$domain" -json -silent 2>>"$LOG_FILE" >> "${ASN_DIR}/asnmap_json_raw.jsonl" || true
+            safe_timeout 60s asnmap -d "$domain" -silent 2>>"$LOG_FILE" >> "${ASN_DIR}/asnmap_results_raw.txt" || true
+            safe_timeout 60s asnmap -d "$domain" -json -silent 2>>"$LOG_FILE" >> "${ASN_DIR}/asnmap_json_raw.jsonl" || true
         done < "$TARGET_FILE"
     fi
     sort -u -o "${ASN_DIR}/asnmap_results_raw.txt" "${ASN_DIR}/asnmap_results_raw.txt"
@@ -2386,43 +2392,47 @@ generate_consolidated_file() {
 
     # Iterate all subdomains and build the consolidated file
     local count=0
-    while IFS= read -r subdomain || [[ -n "$subdomain" ]]; do
-        [[ -z "$subdomain" ]] && continue
-        ((count++)) || true
+    if [[ -f "${OUTPUT_DIR}/subdomains.txt" ]]; then
+        while IFS= read -r subdomain || [[ -n "$subdomain" ]]; do
+            [[ -z "$subdomain" ]] && continue
+            ((count++)) || true
 
-        # Lookup IP
-        local ips
-        ips=$(grep -m1 "^${subdomain}	" "$tmp_ip_map" 2>/dev/null | cut -f2 || echo "-")
-        [[ -z "$ips" ]] && ips="-"
+            # Lookup IP
+            local ips
+            ips=$(grep -m1 "^${subdomain}	" "$tmp_ip_map" 2>/dev/null | cut -f2 || echo "-")
+            [[ -z "$ips" ]] && ips="-"
 
-        # Lookup CNAME
-        local cname
-        cname=$(grep -m1 "^${subdomain}	" "$tmp_cname_map" 2>/dev/null | cut -f2 || echo "-")
-        [[ -z "$cname" ]] && cname="-"
+            # Lookup CNAME
+            local cname
+            cname=$(grep -m1 "^${subdomain}	" "$tmp_cname_map" 2>/dev/null | cut -f2 || echo "-")
+            [[ -z "$cname" ]] && cname="-"
 
-        # Lookup HTTP status
-        local http_status http_title
-        local httpx_line
-        httpx_line=$(grep -m1 "^${subdomain}	" "$tmp_httpx_map" 2>/dev/null || echo "")
-        if [[ -n "$httpx_line" ]]; then
-            http_status=$(echo "$httpx_line" | cut -f2)
-            http_title=$(echo "$httpx_line" | cut -f3)
-        else
-            http_status="-"
-            http_title="-"
-        fi
-        [[ -z "$http_status" ]] && http_status="-"
-        [[ -z "$http_title" ]] && http_title="-"
+            # Lookup HTTP status
+            local http_status http_title
+            local httpx_line
+            httpx_line=$(grep -m1 "^${subdomain}	" "$tmp_httpx_map" 2>/dev/null || echo "")
+            if [[ -n "$httpx_line" ]]; then
+                http_status=$(echo "$httpx_line" | cut -f2)
+                http_title=$(echo "$httpx_line" | cut -f3)
+            else
+                http_status="-"
+                http_title="-"
+            fi
+            [[ -z "$http_status" ]] && http_status="-"
+            [[ -z "$http_title" ]] && http_title="-"
 
-        # Write to text file
-        printf "%-60s | %-18s | %-50s | %-6s | %s\n" \
-            "$subdomain" "$ips" "$cname" "$http_status" "$http_title" >> "$master_file"
+            # Write to text file
+            printf "%-60s | %-18s | %-50s | %-6s | %s\n" \
+                "$subdomain" "$ips" "$cname" "$http_status" "$http_title" >> "$master_file"
 
-        # Write to CSV (escape commas in fields)
-        local csv_title="${http_title//,/;}"
-        echo "${subdomain},${ips},${cname},${http_status},${csv_title}" >> "$master_csv"
+            # Write to CSV (escape commas in fields)
+            local csv_title="${http_title//,/;}"
+            echo "${subdomain},${ips},${cname},${http_status},${csv_title}" >> "$master_csv"
 
-    done < "${OUTPUT_DIR}/subdomains.txt"
+        done < "${OUTPUT_DIR}/subdomains.txt"
+    else
+        print_warning "No subdomains file found for consolidated subdomain table."
+    fi
 
     # Also add ASN-discovered IPs that passed SSL ownership validation
     if [[ -f "${SSL_DIR}/ssl_validated_ips.txt" ]]; then
