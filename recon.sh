@@ -1821,6 +1821,7 @@ phase5_vulnerability_scan() {
 
     print_status "Scanning ${target_count} targets with nuclei..."
     print_status "Rate limit: ${RATE_LIMIT} requests/second"
+    print_status "Severity filter: ${NUCLEI_SEVERITY}"
     print_status "Bulk size: ${DEFAULT_NUCLEI_BULK_SIZE}, Concurrency: ${DEFAULT_NUCLEI_CONCURRENCY}"
 
     # Update nuclei templates first
@@ -1834,7 +1835,7 @@ phase5_vulnerability_scan() {
         -rl "$RATE_LIMIT" \
         -bulk-size "$DEFAULT_NUCLEI_BULK_SIZE" \
         -c "$DEFAULT_NUCLEI_CONCURRENCY" \
-        -severity info,low,medium,high,critical \
+        -severity "$NUCLEI_SEVERITY" \
         -silent \
         -stats \
         -stats-interval 30 \
