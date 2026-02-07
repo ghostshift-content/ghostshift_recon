@@ -35,6 +35,8 @@ DEFAULT_SUBFINDER_TIMEOUT=30    # subfinder timeout in minutes
 DEFAULT_AMASS_TIMEOUT=30        # amass timeout in minutes
 DEFAULT_NUCLEI_BULK_SIZE=25     # nuclei bulk size
 DEFAULT_NUCLEI_CONCURRENCY=10   # nuclei template concurrency
+DEFAULT_ENUM_JOBS=4             # parallel root-domain enumeration workers
+DEFAULT_URL_CRAWL_DEPTH=2       # katana/hakrawler depth
 DEFAULT_PORTS="80,443,8080,8443,8000,8888,9090,3000,5000,5443"
 NAABU_TOP_PORTS=""              # if set, use top-ports instead of port list
 
@@ -144,6 +146,89 @@ count_lines() {
     fi
 }
 
+delete_empty_lines() {
+    local file="$1"
+    [[ ! -f "$file" ]] && return 0
+    awk 'NF {print}' "$file" > "${file}.tmp.$$" 2>/dev/null || true
+    mv "${file}.tmp.$$" "$file" 2>/dev/null || true
+}
+
+extract_ipv4s() {
+    local input_file="$1"
+    [[ ! -e "$input_file" ]] && return 0
+    awk '
+    {
+        for (i = 1; i <= NF; i++) {
+            token = $i
+            gsub(/[^0-9.]/, "", token)
+            if (token ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                print token
+            }
+        }
+    }' "$input_file"
+}
+
+extract_cidrs() {
+    local input_file="$1"
+    [[ ! -e "$input_file" ]] && return 0
+    awk '
+    {
+        for (i = 1; i <= NF; i++) {
+            token = $i
+            gsub(/[^0-9.\/]/, "", token)
+            if (token ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}\/[0-9]{1,2}$/) {
+                print token
+            }
+        }
+    }' "$input_file"
+}
+
+normalize_asn() {
+    local input="$1"
+    input=$(echo "$input" | tr -d '[:space:]')
+    if [[ "$input" =~ ^AS[0-9]+$ ]]; then
+        echo "$input"
+    elif [[ "$input" =~ ^[0-9]+$ ]]; then
+        echo "AS${input}"
+    else
+        echo ""
+    fi
+}
+
+string_matches_keywords() {
+    local value="$1"
+    local keywords_file="$2"
+    local val_lower
+    val_lower=$(echo "$value" | tr '[:upper:]' '[:lower:]')
+
+    if [[ -z "$val_lower" ]] || [[ ! -f "$keywords_file" ]]; then
+        return 1
+    fi
+
+    while IFS= read -r kw || [[ -n "$kw" ]]; do
+        kw=$(echo "$kw" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+        [[ -z "$kw" ]] && continue
+        [[ ${#kw} -lt 3 ]] && continue
+        if echo "$val_lower" | grep -Fqi "$kw" 2>/dev/null; then
+            return 0
+        fi
+    done < "$keywords_file"
+    return 1
+}
+
+ip_sort_unique() {
+    local input_file="$1"
+    local output_file="$2"
+    if [[ -f "$input_file" ]]; then
+        local tmp_file
+        tmp_file="${output_file}.tmp.$$"
+        sort -t. -k1,1n -k2,2n -k3,3n -k4,4n -u "$input_file" > "$tmp_file" 2>/dev/null || touch "$tmp_file"
+        mv "$tmp_file" "$output_file" 2>/dev/null || true
+    else
+        touch "$output_file"
+    fi
+}
+
 # ============================================================================
 # TOOL VERIFICATION
 # ============================================================================
@@ -167,6 +252,10 @@ OPTIONAL_TOOLS=(
     "amass"
     "chaos"
     "anew"
+    "gau"
+    "waybackurls"
+    "katana"
+    "hakrawler"
 )
 
 check_tools() {
@@ -258,7 +347,7 @@ merge_files() {
     done
     sort -u -o "$output" "$output"
     # Remove empty lines
-    sed -i '/^$/d' "$output" 2>/dev/null || true
+    delete_empty_lines "$output"
 }
 
 extract_domain_from_url() {
@@ -276,6 +365,37 @@ extract_root_domain() {
             print $0
         }
     }'
+}
+
+is_domain_in_scope() {
+    local candidate="$1"
+    candidate=$(echo "$candidate" | tr '[:upper:]' '[:lower:]')
+    while IFS= read -r target_domain || [[ -n "$target_domain" ]]; do
+        target_domain=$(echo "$target_domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+        [[ -z "$target_domain" || "$target_domain" == \#* ]] && continue
+        if [[ "$candidate" == "$target_domain" ]] || [[ "$candidate" == *".${target_domain}" ]]; then
+            return 0
+        fi
+    done < "$TARGET_FILE"
+    return 1
+}
+
+scope_filter_urls_file() {
+    local input_file="$1"
+    local output_file="$2"
+    : > "$output_file"
+    [[ ! -f "$input_file" ]] && return 0
+    while IFS= read -r url || [[ -n "$url" ]]; do
+        [[ -z "$url" ]] && continue
+        local host
+        host=$(extract_domain_from_url "$url")
+        [[ -z "$host" ]] && continue
+        if is_domain_in_scope "$host"; then
+            echo "$url" >> "$output_file"
+        fi
+    done < "$input_file"
+    sort -u -o "$output_file" "$output_file" 2>/dev/null || true
+    delete_empty_lines "$output_file"
 }
 
 is_ip() {
@@ -415,17 +535,24 @@ phase1_subdomain_enumeration() {
         domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
         [[ -z "$domain" || "$domain" == \#* ]] && continue
 
+        while [[ $(jobs -pr | wc -l | tr -d ' ') -ge "$ENUM_JOBS" ]]; do
+            sleep 1
+        done
+
         echo ""
         echo -e "${BOLD}${WHITE}── Target: ${domain} ──${NC}"
 
-        # Run all enumeration sources
-        run_subfinder "$domain"
-        run_assetfinder "$domain"
-        run_amass_passive "$domain"
-        run_crtsh "$domain"
-        run_chaos "$domain"
+        (
+            # Run all enumeration sources
+            run_subfinder "$domain"
+            run_assetfinder "$domain"
+            run_amass_passive "$domain"
+            run_crtsh "$domain"
+            run_chaos "$domain"
+        ) &
 
     done < "$TARGET_FILE"
+    wait || true
 
     # Merge and deduplicate all results
     echo ""
@@ -452,7 +579,7 @@ phase1_subdomain_enumeration() {
     done < "$TARGET_FILE"
 
     sort -u -o "${OUTPUT_DIR}/subdomains.txt" "${OUTPUT_DIR}/subdomains.txt"
-    sed -i '/^$/d' "${OUTPUT_DIR}/subdomains.txt" 2>/dev/null || true
+    delete_empty_lines "${OUTPUT_DIR}/subdomains.txt"
 
     local final_count
     final_count=$(count_lines "${OUTPUT_DIR}/subdomains.txt")
@@ -514,15 +641,15 @@ phase2_dns_and_livehost() {
         # --- Subdomain-to-IP lookup table (clean TSV: subdomain<tab>ip) ---
         grep '\[A\]' "${DNS_DIR}/dnsx_resolved.txt" 2>/dev/null \
             | awk '{
-                sub = $1
+                host = $1
                 for (i=2; i<=NF; i++) {
                     if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
-                        printf "%s\t%s\n", sub, $i
+                        printf "%s\t%s\n", host, $i
                     } else {
                         # strip brackets from [ip]
                         gsub(/[\[\]]/, "", $i)
                         if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
-                            printf "%s\t%s\n", sub, $i
+                            printf "%s\t%s\n", host, $i
                         }
                     }
                 }
@@ -554,7 +681,7 @@ phase2_dns_and_livehost() {
     # --- Extract unique IPs from DNS results ---
     print_progress "Extracting IP addresses from DNS results..."
 
-    grep -oP '\d+\.\d+\.\d+\.\d+' "${DNS_DIR}/dnsx_resolved.txt" 2>/dev/null \
+    extract_ipv4s "${DNS_DIR}/dnsx_resolved.txt" \
         | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n -u \
         > "${DNS_DIR}/resolved_ips.txt" || touch "${DNS_DIR}/resolved_ips.txt"
 
@@ -615,23 +742,9 @@ query_bgp_he_net() {
 
     if [[ -n "$response" ]]; then
         echo "$response" \
-            | grep -oP '\d+\.\d+\.\d+\.\d+/\d+' \
+            | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' \
             | sort -u >> "$outfile" 2>/dev/null || true
     fi
-}
-
-validate_asn_ownership() {
-    local asn="$1"
-    local target_org="$2"
-
-    # Validate the ASN actually belongs to the target org via whois
-    local whois_data
-    whois_data=$(whois "$asn" 2>/dev/null | head -50 || echo "")
-
-    if echo "$whois_data" | grep -qi "$target_org" 2>/dev/null; then
-        return 0  # Matches
-    fi
-    return 1  # Does not match
 }
 
 phase3_asn_discovery() {
@@ -639,7 +752,6 @@ phase3_asn_discovery() {
 
     mkdir -p "$ASN_DIR"
 
-    # --- Derive organization name from target domains ---
     print_progress "Discovering ASN information for target domains..."
 
     local ip_file="${DNS_DIR}/resolved_ips.txt"
@@ -678,41 +790,31 @@ phase3_asn_discovery() {
     asnmap -i "$ip_file" \
         -silent \
         2>>"$LOG_FILE" \
-        | sort -u > "${ASN_DIR}/asnmap_results.txt" || touch "${ASN_DIR}/asnmap_results.txt"
+        | sort -u > "${ASN_DIR}/asnmap_results_raw.txt" || touch "${ASN_DIR}/asnmap_results_raw.txt"
 
-    # Also map domains directly
+    asnmap -i "$ip_file" \
+        -json \
+        -silent \
+        2>>"$LOG_FILE" \
+        > "${ASN_DIR}/asnmap_json_raw.jsonl" || touch "${ASN_DIR}/asnmap_json_raw.jsonl"
+
+    # Also map root domains directly
     if [[ -f "$TARGET_FILE" ]]; then
-        asnmap -d "$(paste -sd, "$TARGET_FILE")" \
-            -silent \
-            2>>"$LOG_FILE" \
-            | sort -u >> "${ASN_DIR}/asnmap_results.txt" || true
-        sort -u -o "${ASN_DIR}/asnmap_results.txt" "${ASN_DIR}/asnmap_results.txt"
+        while IFS= read -r domain || [[ -n "$domain" ]]; do
+            domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            [[ -z "$domain" || "$domain" == \#* ]] && continue
+            asnmap -d "$domain" -silent 2>>"$LOG_FILE" >> "${ASN_DIR}/asnmap_results_raw.txt" || true
+            asnmap -d "$domain" -json -silent 2>>"$LOG_FILE" >> "${ASN_DIR}/asnmap_json_raw.jsonl" || true
+        done < "$TARGET_FILE"
     fi
+    sort -u -o "${ASN_DIR}/asnmap_results_raw.txt" "${ASN_DIR}/asnmap_results_raw.txt"
+    sort -u -o "${ASN_DIR}/asnmap_json_raw.jsonl" "${ASN_DIR}/asnmap_json_raw.jsonl"
 
     local asn_count
-    asn_count=$(count_lines "${ASN_DIR}/asnmap_results.txt")
-    print_status "asnmap discovered ${asn_count} CIDR ranges"
+    asn_count=$(count_lines "${ASN_DIR}/asnmap_results_raw.txt")
+    print_status "asnmap discovered ${asn_count} raw ownership records"
 
-    # --- Extract unique ASNs ---
-    print_progress "Extracting unique ASN numbers..."
-
-    # Try to get ASN numbers from asnmap's JSON mode
-    asnmap -i "$ip_file" \
-        -json \
-        -silent \
-        2>>"$LOG_FILE" \
-        | jq -r '.as_number // empty' 2>/dev/null \
-        | sort -u > "${ASN_DIR}/unique_asns.txt" || touch "${ASN_DIR}/unique_asns.txt"
-
-    # Also extract ASN info for reporting
-    asnmap -i "$ip_file" \
-        -json \
-        -silent \
-        2>>"$LOG_FILE" \
-        | jq -r '[.as_number, .as_name, .as_country, .first_ip + "-" + .last_ip] | @tsv' 2>/dev/null \
-        | sort -u > "${ASN_DIR}/asn_info.txt" || touch "${ASN_DIR}/asn_info.txt"
-
-    # --- Extract organization names for validation ---
+    # --- Extract organization names and keywords ---
     local org_names=()
     while IFS= read -r domain || [[ -n "$domain" ]]; do
         domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
@@ -721,10 +823,11 @@ phase3_asn_discovery() {
         # Try whois to get org name
         local org
         org=$(whois "$domain" 2>/dev/null \
-            | grep -i "^org\|^registrant.*org\|^OrgName" \
+            | grep -i "^org\|^registrant.*org\|^OrgName\|^Organization\|^owner\|^descr" \
             | head -1 \
             | sed 's/^[^:]*:\s*//' \
-            | tr -d '[:space:]' || echo "")
+            | sed 's/[[:space:]]\+/ /g' \
+            | sed 's/^ //; s/ $//' || echo "")
 
         if [[ -n "$org" ]]; then
             org_names+=("$org")
@@ -739,19 +842,90 @@ phase3_asn_discovery() {
     # Save org names for later SSL validation
     printf '%s\n' "${org_names[@]}" | sort -u > "${ASN_DIR}/org_names.txt" 2>/dev/null || true
 
+    # Create keyword set from org names and target roots
+    : > "${ASN_DIR}/org_keywords.txt"
+    while IFS= read -r value || [[ -n "$value" ]]; do
+        [[ -z "$value" ]] && continue
+        echo "$value" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9]/ /g' \
+            | tr ' ' '\n' \
+            | awk 'length($0)>=3 {print}' >> "${ASN_DIR}/org_keywords.txt"
+    done < "${ASN_DIR}/org_names.txt"
+    sort -u -o "${ASN_DIR}/org_keywords.txt" "${ASN_DIR}/org_keywords.txt"
+
+    # --- Extract trusted ASNs from asnmap json ---
+    print_progress "Filtering ASN data by organization ownership keywords..."
+
+    : > "${ASN_DIR}/unique_asns.txt"
+    : > "${ASN_DIR}/trusted_asns.txt"
+    : > "${ASN_DIR}/asn_info.txt"
+
+    while IFS= read -r jline || [[ -n "$jline" ]]; do
+        [[ -z "$jline" ]] && continue
+        local asn_num asn_name first_ip last_ip country asn_norm
+        asn_num=$(echo "$jline" | jq -r '.as_number // empty' 2>/dev/null || echo "")
+        asn_name=$(echo "$jline" | jq -r '.as_name // .as_org // empty' 2>/dev/null || echo "")
+        first_ip=$(echo "$jline" | jq -r '.first_ip // empty' 2>/dev/null || echo "")
+        last_ip=$(echo "$jline" | jq -r '.last_ip // empty' 2>/dev/null || echo "")
+        country=$(echo "$jline" | jq -r '.as_country // empty' 2>/dev/null || echo "")
+
+        asn_norm=$(normalize_asn "$asn_num")
+        [[ -z "$asn_norm" ]] && continue
+
+        echo "$asn_norm" >> "${ASN_DIR}/unique_asns.txt"
+        printf "%s\t%s\t%s\t%s-%s\n" "$asn_norm" "$asn_name" "$country" "$first_ip" "$last_ip" >> "${ASN_DIR}/asn_info.txt"
+
+        if string_matches_keywords "$asn_name" "${ASN_DIR}/org_keywords.txt"; then
+            echo "$asn_norm" >> "${ASN_DIR}/trusted_asns.txt"
+        fi
+    done < "${ASN_DIR}/asnmap_json_raw.jsonl"
+
+    sort -u -o "${ASN_DIR}/unique_asns.txt" "${ASN_DIR}/unique_asns.txt"
+    sort -u -o "${ASN_DIR}/trusted_asns.txt" "${ASN_DIR}/trusted_asns.txt"
+    sort -u -o "${ASN_DIR}/asn_info.txt" "${ASN_DIR}/asn_info.txt"
+
+    local trusted_asn_count
+    trusted_asn_count=$(count_lines "${ASN_DIR}/trusted_asns.txt")
+    if [[ "$trusted_asn_count" -eq 0 ]]; then
+        print_warning "No ASN names matched org keywords. Falling back to all discovered ASNs."
+        cp "${ASN_DIR}/unique_asns.txt" "${ASN_DIR}/trusted_asns.txt" 2>/dev/null || touch "${ASN_DIR}/trusted_asns.txt"
+        trusted_asn_count=$(count_lines "${ASN_DIR}/trusted_asns.txt")
+    fi
+    print_status "Trusted ASN candidates: ${trusted_asn_count}"
+
+    # Parse CIDRs from asnmap raw output and keep only trusted ASN lines where ASN exists
+    : > "${ASN_DIR}/asnmap_cidrs.txt"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        local line_asn include_line
+        line_asn=$(echo "$line" | grep -Eo 'AS[0-9]+' | head -1 || true)
+        include_line=true
+        if [[ -n "$line_asn" ]] && [[ -f "${ASN_DIR}/trusted_asns.txt" ]]; then
+            if ! grep -qx "$line_asn" "${ASN_DIR}/trusted_asns.txt" 2>/dev/null; then
+                include_line=false
+            fi
+        fi
+        if [[ "$include_line" == true ]]; then
+            echo "$line" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' >> "${ASN_DIR}/asnmap_cidrs.txt" 2>/dev/null || true
+        fi
+    done < "${ASN_DIR}/asnmap_results_raw.txt"
+    sort -u -o "${ASN_DIR}/asnmap_cidrs.txt" "${ASN_DIR}/asnmap_cidrs.txt"
+
     # --- BGP.he.net enrichment ---
     print_progress "Enriching ASN data from BGP.he.net..."
 
     : > "${ASN_DIR}/bgp_cidrs.txt"
     while IFS= read -r asn || [[ -n "$asn" ]]; do
         [[ -z "$asn" ]] && continue
-        asn=$(echo "$asn" | grep -oP 'AS\d+' || echo "$asn")
+        asn=$(normalize_asn "$asn")
         [[ -z "$asn" ]] && continue
 
         print_status "  Querying BGP.he.net for ${asn}..."
         query_bgp_he_net "$asn" "${ASN_DIR}/bgp_cidrs.txt"
         sleep 1  # Rate limiting for BGP.he.net
-    done < "${ASN_DIR}/unique_asns.txt"
+    done < "${ASN_DIR}/trusted_asns.txt"
+    sort -u -o "${ASN_DIR}/bgp_cidrs.txt" "${ASN_DIR}/bgp_cidrs.txt"
 
     local bgp_count
     bgp_count=$(count_lines "${ASN_DIR}/bgp_cidrs.txt")
@@ -761,8 +935,9 @@ phase3_asn_discovery() {
     print_progress "Merging all discovered CIDR ranges..."
 
     merge_files "${OUTPUT_DIR}/asn_cidrs.txt" \
-        "${ASN_DIR}/asnmap_results.txt" \
+        "${ASN_DIR}/asnmap_cidrs.txt" \
         "${ASN_DIR}/bgp_cidrs.txt"
+    delete_empty_lines "${OUTPUT_DIR}/asn_cidrs.txt"
 
     local total_cidrs
     total_cidrs=$(count_lines "${OUTPUT_DIR}/asn_cidrs.txt")
@@ -792,8 +967,10 @@ phase3_asn_discovery() {
         merge_files "${OUTPUT_DIR}/asn_ips.txt" \
             "$ip_file" \
             "${ASN_DIR}/expanded_ips.txt"
+        ip_sort_unique "${OUTPUT_DIR}/asn_ips.txt" "${OUTPUT_DIR}/asn_ips.txt"
     else
         cp "$ip_file" "${OUTPUT_DIR}/asn_ips.txt" 2>/dev/null || touch "${OUTPUT_DIR}/asn_ips.txt"
+        ip_sort_unique "${OUTPUT_DIR}/asn_ips.txt" "${OUTPUT_DIR}/asn_ips.txt"
     fi
 
     local total_ips
@@ -838,14 +1015,8 @@ phase3_asn_discovery() {
         asn_live=$(count_lines "${ASN_DIR}/httpx_asn_ips.txt")
         print_status "  httpx found ${asn_live} live services on ASN IPs"
 
-        # Merge into master live hosts
         if [[ "$asn_live" -gt 0 ]]; then
-            awk '{print $1}' "${ASN_DIR}/httpx_asn_ips.txt" \
-                | sort -u >> "${OUTPUT_DIR}/live_hosts.txt"
-            sort -u -o "${OUTPUT_DIR}/live_hosts.txt" "${OUTPUT_DIR}/live_hosts.txt"
-
-            cat "${ASN_DIR}/httpx_asn_ips.txt" >> "${OUTPUT_DIR}/live_hosts_full.txt"
-            sort -u -o "${OUTPUT_DIR}/live_hosts_full.txt" "${OUTPUT_DIR}/live_hosts_full.txt"
+            awk '{print $1}' "${ASN_DIR}/httpx_asn_ips.txt" | sort -u > "${ASN_DIR}/asn_live_urls.txt"
         fi
     else
         print_status "  All ASN IPs were already covered by Phase 2. Skipping."
@@ -855,6 +1026,7 @@ phase3_asn_discovery() {
     print_success "Phase 3 Complete: ${total_cidrs} CIDRs, ${total_ips} IPs enumerated"
     print_finding "CIDR ranges: ${OUTPUT_DIR}/asn_cidrs.txt"
     print_finding "IP addresses: ${OUTPUT_DIR}/asn_ips.txt"
+    print_finding "Trusted ASNs: ${ASN_DIR}/trusted_asns.txt"
     print_finding "ASN IP httpx results: ${ASN_DIR}/httpx_asn_ips.txt"
     print_finding "ASN info: ${ASN_DIR}/asn_info.txt"
 
@@ -988,7 +1160,7 @@ phase4_ssl_validation() {
     fi
 
     sort -u -o "${SSL_DIR}/tlsx_targets.txt" "${SSL_DIR}/tlsx_targets.txt"
-    sed -i '/^$/d' "${SSL_DIR}/tlsx_targets.txt" 2>/dev/null || true
+    delete_empty_lines "${SSL_DIR}/tlsx_targets.txt"
 
     local target_count
     target_count=$(count_lines "${SSL_DIR}/tlsx_targets.txt")
@@ -1033,6 +1205,8 @@ phase4_ssl_validation() {
     : > "${SSL_DIR}/unvalidated_hosts.txt"
     : > "${SSL_DIR}/validation_report.txt"
     : > "${OUTPUT_DIR}/ssl_validated_subdomains.txt"
+    : > "${SSL_DIR}/ssl_validated_ips.txt"
+    : > "${SSL_DIR}/ssl_validated_ip_hosts.txt"
 
     local validated=0
     local rejected=0
@@ -1127,6 +1301,17 @@ phase4_ssl_validation() {
             echo "[VALID] ${host} | CN=${subject_cn} | Org=${subject_org} | Reason: ${match_reason}" \
                 >> "${SSL_DIR}/validation_report.txt"
 
+            local host_no_port ip_no_port
+            host_no_port=$(echo "$host" | sed 's/:.*$//')
+            ip_no_port=$(echo "$ip" | sed 's/:.*$//')
+            if is_ip "$host_no_port"; then
+                echo "$host_no_port" >> "${SSL_DIR}/ssl_validated_ips.txt"
+                echo "$host" >> "${SSL_DIR}/ssl_validated_ip_hosts.txt"
+            fi
+            if is_ip "$ip_no_port"; then
+                echo "$ip_no_port" >> "${SSL_DIR}/ssl_validated_ips.txt"
+            fi
+
             # Extract additional subdomains from SANs of validated certs
             if [[ -n "$san_list" ]]; then
                 echo "$san_list" | tr ',' '\n' | sed 's/^ *//' | sed 's/\*\.//' \
@@ -1144,11 +1329,13 @@ phase4_ssl_validation() {
     # Deduplicate validated results
     sort -u -o "${SSL_DIR}/validated_hosts.txt" "${SSL_DIR}/validated_hosts.txt" 2>/dev/null || true
     sort -u -o "${SSL_DIR}/unvalidated_hosts.txt" "${SSL_DIR}/unvalidated_hosts.txt" 2>/dev/null || true
+    ip_sort_unique "${SSL_DIR}/ssl_validated_ips.txt" "${SSL_DIR}/ssl_validated_ips.txt"
+    sort -u -o "${SSL_DIR}/ssl_validated_ip_hosts.txt" "${SSL_DIR}/ssl_validated_ip_hosts.txt" 2>/dev/null || true
 
     # Deduplicate and filter SSL-discovered subdomains
     if [[ -f "${OUTPUT_DIR}/ssl_validated_subdomains.txt" ]]; then
         sort -u -o "${OUTPUT_DIR}/ssl_validated_subdomains.txt" "${OUTPUT_DIR}/ssl_validated_subdomains.txt"
-        sed -i '/^$/d' "${OUTPUT_DIR}/ssl_validated_subdomains.txt" 2>/dev/null || true
+        delete_empty_lines "${OUTPUT_DIR}/ssl_validated_subdomains.txt"
 
         # Filter to only include target-domain subdomains
         : > "${SSL_DIR}/ssl_new_subs.txt"
@@ -1176,6 +1363,20 @@ phase4_ssl_validation() {
         fi
     fi
 
+    : > "${SSL_DIR}/ssl_validated_ip_urls.txt"
+    if [[ -f "${ASN_DIR}/httpx_asn_ips.txt" ]] && [[ -f "${SSL_DIR}/ssl_validated_ips.txt" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" ]] && continue
+            local url host_part
+            url=$(echo "$line" | awk '{print $1}')
+            host_part=$(extract_domain_from_url "$url")
+            if is_ip "$host_part" && grep -qx "$host_part" "${SSL_DIR}/ssl_validated_ips.txt" 2>/dev/null; then
+                echo "$url" >> "${SSL_DIR}/ssl_validated_ip_urls.txt"
+            fi
+        done < "${ASN_DIR}/httpx_asn_ips.txt"
+        sort -u -o "${SSL_DIR}/ssl_validated_ip_urls.txt" "${SSL_DIR}/ssl_validated_ip_urls.txt"
+    fi
+
     echo ""
     echo -e "${BOLD}${WHITE}── SSL Validation Summary ──${NC}"
     echo -e "  ${GREEN}Validated:${NC}  ${validated} certificates match target org"
@@ -1185,6 +1386,7 @@ phase4_ssl_validation() {
     print_success "Phase 4 Complete: SSL certificate validation finished"
     print_finding "Validation report: ${SSL_DIR}/validation_report.txt"
     print_finding "Validated hosts: ${SSL_DIR}/validated_hosts.txt"
+    print_finding "Validated IPs: ${SSL_DIR}/ssl_validated_ips.txt"
 }
 
 # ============================================================================
@@ -1328,7 +1530,7 @@ phase4b_rescan_ssl_discoveries() {
     done < "$TARGET_FILE"
 
     sort -u -o "${SSL_DIR}/rescan_scoped_subs.txt" "${SSL_DIR}/rescan_scoped_subs.txt"
-    sed -i '/^$/d' "${SSL_DIR}/rescan_scoped_subs.txt" 2>/dev/null || true
+    delete_empty_lines "${SSL_DIR}/rescan_scoped_subs.txt"
 
     # Find what's truly new vs what Phase 1 already had
     local truly_new="${SSL_DIR}/rescan_truly_new.txt"
@@ -1397,8 +1599,8 @@ phase4b_rescan_ssl_discoveries() {
             sort -u -o "${OUTPUT_DIR}/resolved_hosts.txt" "${OUTPUT_DIR}/resolved_hosts.txt"
 
             # Extract new IPs and merge
-            grep -oP '\d+\.\d+\.\d+\.\d+' "${SSL_DIR}/rescan_dnsx.txt" 2>/dev/null \
-                | sort -u > "${SSL_DIR}/rescan_ips.txt" || touch "${SSL_DIR}/rescan_ips.txt"
+            extract_ipv4s "${SSL_DIR}/rescan_dnsx.txt" \
+                | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n -u > "${SSL_DIR}/rescan_ips.txt" || touch "${SSL_DIR}/rescan_ips.txt"
 
             if [[ -f "${DNS_DIR}/resolved_ips.txt" ]]; then
                 cat "${SSL_DIR}/rescan_ips.txt" >> "${DNS_DIR}/resolved_ips.txt"
@@ -1500,6 +1702,75 @@ phase4b_rescan_ssl_discoveries() {
 # PHASE 5: VULNERABILITY SCANNING
 # ============================================================================
 
+collect_url_intelligence() {
+    local raw_urls="${VULN_DIR}/url_intel_raw.txt"
+    local scoped_urls="${VULN_DIR}/url_intel_scoped.txt"
+    local param_urls="${VULN_DIR}/url_intel_params.txt"
+    local js_urls="${VULN_DIR}/url_intel_js.txt"
+
+    : > "$raw_urls"
+    : > "$scoped_urls"
+    : > "$param_urls"
+    : > "$js_urls"
+
+    print_progress "Collecting URL intelligence (wayback/gau/crawler)..."
+
+    # Historical URLs from root domains + discovered subdomains
+    local archive_sources="${VULN_DIR}/url_sources.txt"
+    : > "$archive_sources"
+    if [[ -f "$TARGET_FILE" ]]; then
+        cat "$TARGET_FILE" | grep -v '^\s*#' | grep -v '^\s*$' >> "$archive_sources" || true
+    fi
+    if [[ -f "${OUTPUT_DIR}/subdomains.txt" ]]; then
+        cat "${OUTPUT_DIR}/subdomains.txt" >> "$archive_sources"
+    fi
+    sort -u -o "$archive_sources" "$archive_sources"
+    delete_empty_lines "$archive_sources"
+
+    if command -v waybackurls &>/dev/null; then
+        waybackurls < "$archive_sources" >> "$raw_urls" 2>>"$LOG_FILE" || true
+    fi
+
+    if command -v gau &>/dev/null; then
+        gau --subs --providers wayback,commoncrawl,otx,urlscan -threads "$DEFAULT_THREADS" \
+            < "$archive_sources" >> "$raw_urls" 2>>"$LOG_FILE" || true
+    fi
+
+    # Optional active crawl from already-live hosts
+    if [[ -f "${OUTPUT_DIR}/live_hosts.txt" ]] && [[ $(count_lines "${OUTPUT_DIR}/live_hosts.txt") -gt 0 ]]; then
+        if command -v katana &>/dev/null; then
+            katana -list "${OUTPUT_DIR}/live_hosts.txt" \
+                -silent \
+                -d "$DEFAULT_URL_CRAWL_DEPTH" \
+                -jc \
+                -timeout 10 \
+                >> "$raw_urls" 2>>"$LOG_FILE" || true
+        fi
+
+        if command -v hakrawler &>/dev/null; then
+            cat "${OUTPUT_DIR}/live_hosts.txt" \
+                | hakrawler -depth "$DEFAULT_URL_CRAWL_DEPTH" -plain \
+                >> "$raw_urls" 2>>"$LOG_FILE" || true
+        fi
+    fi
+
+    sort -u -o "$raw_urls" "$raw_urls"
+    delete_empty_lines "$raw_urls"
+
+    # Keep only in-scope URLs
+    scope_filter_urls_file "$raw_urls" "$scoped_urls"
+
+    # Parameterized URLs are high-value for bug bounty testing
+    if [[ -f "$scoped_urls" ]]; then
+        grep '?' "$scoped_urls" | sort -u > "$param_urls" 2>/dev/null || touch "$param_urls"
+        grep -Ei '\.js([?#].*)?$' "$scoped_urls" | sort -u > "$js_urls" 2>/dev/null || touch "$js_urls"
+    fi
+
+    print_status "URL intel total: $(count_lines "$scoped_urls")"
+    print_status "URL intel with params: $(count_lines "$param_urls")"
+    print_status "URL intel JS files: $(count_lines "$js_urls")"
+}
+
 phase5_vulnerability_scan() {
     phase_banner "5" "VULNERABILITY SCANNING (NUCLEI)"
 
@@ -1526,8 +1797,19 @@ phase5_vulnerability_scan() {
         done < "${SSL_DIR}/validated_hosts.txt"
     fi
 
+    # Add only SSL-validated IP URLs (strict false-positive reduction for ASN IPs)
+    if [[ -f "${SSL_DIR}/ssl_validated_ip_urls.txt" ]]; then
+        cat "${SSL_DIR}/ssl_validated_ip_urls.txt" >> "${VULN_DIR}/nuclei_targets.txt"
+    fi
+
+    # Add URL intelligence targets for deeper bug bounty coverage
+    collect_url_intelligence
+    if [[ -f "${VULN_DIR}/url_intel_scoped.txt" ]]; then
+        cat "${VULN_DIR}/url_intel_scoped.txt" >> "${VULN_DIR}/nuclei_targets.txt"
+    fi
+
     sort -u -o "${VULN_DIR}/nuclei_targets.txt" "${VULN_DIR}/nuclei_targets.txt"
-    sed -i '/^$/d' "${VULN_DIR}/nuclei_targets.txt" 2>/dev/null || true
+    delete_empty_lines "${VULN_DIR}/nuclei_targets.txt"
 
     local target_count
     target_count=$(count_lines "${VULN_DIR}/nuclei_targets.txt")
@@ -1628,12 +1910,12 @@ generate_consolidated_file() {
     # IP map: subdomain → IPs (comma-separated if multiple)
     if [[ -f "${DNS_DIR}/dns_a_records.txt" ]]; then
         awk '{
-            sub = $1
+            host = $1
             for (i=2; i<=NF; i++) {
                 gsub(/[\[\]]/, "", $i)
                 if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
-                    if (sub in ips) ips[sub] = ips[sub] "," $i
-                    else ips[sub] = $i
+                    if (host in ips) ips[host] = ips[host] "," $i
+                    else ips[host] = $i
                 }
             }
         } END {
@@ -1646,11 +1928,11 @@ generate_consolidated_file() {
     # CNAME map: subdomain → cname target
     if [[ -f "${DNS_DIR}/dns_cname_records.txt" ]]; then
         awk '{
-            sub = $1
+            host = $1
             for (i=2; i<=NF; i++) {
                 gsub(/[\[\]]/, "", $i)
                 if ($i != "[CNAME]" && $i != "CNAME" && $i ~ /\./) {
-                    print sub "\t" $i
+                    print host "\t" $i
                     break
                 }
             }
@@ -1661,6 +1943,10 @@ generate_consolidated_file() {
 
     # httpx map: hostname → status,title,tech
     if [[ -f "${OUTPUT_DIR}/live_hosts_full.txt" ]]; then
+        cp "${OUTPUT_DIR}/live_hosts_full.txt" "${ASN_DIR}/consolidated_httpx_input.txt" 2>/dev/null || true
+        if [[ -f "${ASN_DIR}/httpx_asn_ips.txt" ]]; then
+            cat "${ASN_DIR}/httpx_asn_ips.txt" >> "${ASN_DIR}/consolidated_httpx_input.txt"
+        fi
         awk '{
             url = $1
             # Extract hostname from URL
@@ -1684,7 +1970,7 @@ generate_consolidated_file() {
                 print url "\t" status "\t" title
                 seen[url] = 1
             }
-        }' "${OUTPUT_DIR}/live_hosts_full.txt" | sort -u > "$tmp_httpx_map" 2>/dev/null || touch "$tmp_httpx_map"
+        }' "${ASN_DIR}/consolidated_httpx_input.txt" | sort -u > "$tmp_httpx_map" 2>/dev/null || touch "$tmp_httpx_map"
     else
         touch "$tmp_httpx_map"
     fi
@@ -1729,11 +2015,11 @@ generate_consolidated_file() {
 
     done < "${OUTPUT_DIR}/subdomains.txt"
 
-    # Also add ASN-discovered IPs that aren't subdomains
-    if [[ -f "${OUTPUT_DIR}/asn_ips.txt" ]]; then
+    # Also add ASN-discovered IPs that passed SSL ownership validation
+    if [[ -f "${SSL_DIR}/ssl_validated_ips.txt" ]]; then
         echo "" >> "$master_file"
         printf "%s\n" "$(printf '─%.0s' {1..160})" >> "$master_file"
-        printf "%-60s\n" "ASN-DISCOVERED IPs (not mapped to subdomains above)" >> "$master_file"
+        printf "%-60s\n" "SSL-VALIDATED ASN IPs (owned by target org)" >> "$master_file"
         printf "%s\n" "$(printf '─%.0s' {1..160})" >> "$master_file"
 
         while IFS= read -r ip || [[ -n "$ip" ]]; do
@@ -1759,11 +2045,11 @@ generate_consolidated_file() {
 
                 echo "${ip},${ip},-,${ip_http_status},${ip_http_title}" >> "$master_csv"
             fi
-        done < "${OUTPUT_DIR}/asn_ips.txt"
+        done < "${SSL_DIR}/ssl_validated_ips.txt"
     fi
 
     # Clean up temp files
-    rm -f "$tmp_ip_map" "$tmp_cname_map" "$tmp_httpx_map" 2>/dev/null || true
+    rm -f "$tmp_ip_map" "$tmp_cname_map" "$tmp_httpx_map" "${ASN_DIR}/consolidated_httpx_input.txt" 2>/dev/null || true
 
     print_success "Consolidated file: ${count} subdomains + ASN IPs"
     print_finding "Master TXT: ${master_file}"
@@ -1804,8 +2090,12 @@ generate_report() {
         echo "  ASN CIDR ranges:           $(count_lines "${OUTPUT_DIR}/asn_cidrs.txt" 2>/dev/null || echo 0)"
         echo "  Enumerated IPs:            $(count_lines "${OUTPUT_DIR}/asn_ips.txt" 2>/dev/null || echo 0)"
         echo "  SSL validated hosts:       $(count_lines "${SSL_DIR}/validated_hosts.txt" 2>/dev/null || echo 0)"
+        echo "  SSL validated IPs:         $(count_lines "${SSL_DIR}/ssl_validated_ips.txt" 2>/dev/null || echo 0)"
         echo "  SSL rejected hosts:        $(count_lines "${SSL_DIR}/unvalidated_hosts.txt" 2>/dev/null || echo 0)"
         echo "  SSL-discovered subdomains: $(count_lines "${OUTPUT_DIR}/ssl_validated_subdomains.txt" 2>/dev/null || echo 0)"
+        echo "  URL intel endpoints:       $(count_lines "${VULN_DIR}/url_intel_scoped.txt" 2>/dev/null || echo 0)"
+        echo "    ├─ Parameterized URLs:   $(count_lines "${VULN_DIR}/url_intel_params.txt" 2>/dev/null || echo 0)"
+        echo "    └─ JavaScript URLs:      $(count_lines "${VULN_DIR}/url_intel_js.txt" 2>/dev/null || echo 0)"
         echo ""
 
         if [[ -f "${VULN_DIR}/nuclei_results.jsonl" ]]; then
@@ -1945,6 +2235,8 @@ usage() {
     echo "  -o, --output DIR         Output directory (default: ./recon_results_TIMESTAMP)"
     echo "  -r, --rate-limit N       Nuclei rate limit in req/s (default: ${DEFAULT_RATE_LIMIT})"
     echo "  -t, --threads N          Default thread count (default: ${DEFAULT_THREADS})"
+    echo "      --enum-jobs N        Parallel root-domain enum workers (default: ${DEFAULT_ENUM_JOBS})"
+    echo "      --crawl-depth N      URL crawl depth for katana/hakrawler (default: ${DEFAULT_URL_CRAWL_DEPTH})"
     echo "  -p, --ports PORTS        Comma-separated ports for naabu (default: ${DEFAULT_PORTS})"
     echo "      --top-ports N        Use naabu top-ports mode instead of port list"
     echo "      --phase N            Run only specific phase (1-5, or 4b for SSL re-scan)"
@@ -1956,6 +2248,7 @@ usage() {
     echo "  $0 -f targets.txt"
     echo "  $0 -f targets.txt -o ./results -r 100"
     echo "  $0 -f targets.txt --phase 1"
+    echo "  $0 -f targets.txt --enum-jobs 8 --crawl-depth 3"
     echo "  $0 -f targets.txt --skip-nuclei"
     echo "  $0 -f targets.txt --top-ports 1000"
     echo ""
@@ -1978,6 +2271,8 @@ main() {
     OUTPUT_DIR=""
     RATE_LIMIT="$DEFAULT_RATE_LIMIT"
     THREADS="$DEFAULT_THREADS"
+    ENUM_JOBS="$DEFAULT_ENUM_JOBS"
+    URL_CRAWL_DEPTH="$DEFAULT_URL_CRAWL_DEPTH"
     SPECIFIC_PHASE=""
     SKIP_NUCLEI=false
     NUCLEI_SEVERITY="info,low,medium,high,critical"
@@ -2001,6 +2296,15 @@ main() {
                 DEFAULT_THREADS="$2"
                 DEFAULT_HTTPX_THREADS="$2"
                 DEFAULT_DNSX_THREADS="$2"
+                shift 2
+                ;;
+            --enum-jobs)
+                ENUM_JOBS="$2"
+                shift 2
+                ;;
+            --crawl-depth)
+                URL_CRAWL_DEPTH="$2"
+                DEFAULT_URL_CRAWL_DEPTH="$2"
                 shift 2
                 ;;
             -p|--ports)
@@ -2058,6 +2362,16 @@ main() {
         exit 1
     fi
 
+    if ! [[ "$ENUM_JOBS" =~ ^[0-9]+$ ]] || [[ "$ENUM_JOBS" -lt 1 ]]; then
+        echo -e "${CROSS} Error: --enum-jobs must be a positive integer"
+        exit 1
+    fi
+
+    if ! [[ "$URL_CRAWL_DEPTH" =~ ^[0-9]+$ ]] || [[ "$URL_CRAWL_DEPTH" -lt 1 ]]; then
+        echo -e "${CROSS} Error: --crawl-depth must be a positive integer"
+        exit 1
+    fi
+
     # Set output directory
     if [[ -z "$OUTPUT_DIR" ]]; then
         OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
@@ -2085,6 +2399,8 @@ main() {
     echo -e "  Output:         ${OUTPUT_DIR}"
     echo -e "  Rate limit:     ${RATE_LIMIT} req/s"
     echo -e "  Threads:        ${THREADS}"
+    echo -e "  Enum jobs:      ${ENUM_JOBS}"
+    echo -e "  Crawl depth:    ${URL_CRAWL_DEPTH}"
     echo -e "  Ports:          ${NAABU_TOP_PORTS:+top-${NAABU_TOP_PORTS}}${NAABU_TOP_PORTS:-${DEFAULT_PORTS}}"
     echo -e "  Skip nuclei:    ${SKIP_NUCLEI}"
     echo ""
