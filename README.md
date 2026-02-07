@@ -244,7 +244,14 @@ Runs all enumeration sources per domain, then merges and deduplicates.
 | dnsx | Resolves A, AAAA, CNAME records with multi-threaded DNS queries |
 | httpx | Probes HTTP/HTTPS with status codes, titles, tech detection, content length |
 
-**Output:** `resolved_hosts.txt`, `live_hosts.txt`, `live_hosts_full.txt` (with metadata)
+**Output:**
+- `resolved_hosts.txt` — unique hostnames that resolved
+- `live_hosts.txt` / `live_hosts_full.txt` — live HTTP/HTTPS hosts (with metadata)
+- `phase2_dns/dns_a_records.txt` — sorted A records (subdomain → IP)
+- `phase2_dns/dns_aaaa_records.txt` — sorted AAAA records (subdomain → IPv6)
+- `phase2_dns/dns_cname_records.txt` — sorted CNAME records (subdomain → canonical name)
+- `phase2_dns/subdomain_ip_map.txt` — clean TSV lookup table (subdomain → IP)
+- `phase2_dns/ip_subdomain_map.txt` — reverse lookup (IP → subdomain, numerically sorted)
 
 ### Phase 3: ASN Discovery & IP Enumeration
 
@@ -316,7 +323,12 @@ recon_results_YYYYMMDD_HHMMSS/
 │
 ├── phase2_dns/
 │   ├── dnsx_resolved.txt         # Full DNS resolution output
-│   ├── resolved_ips.txt          # Extracted IP addresses
+│   ├── dns_a_records.txt         # A records sorted by subdomain
+│   ├── dns_aaaa_records.txt      # AAAA records sorted by subdomain
+│   ├── dns_cname_records.txt     # CNAME records sorted by subdomain
+│   ├── subdomain_ip_map.txt      # Clean TSV: subdomain → IP
+│   ├── ip_subdomain_map.txt      # Reverse TSV: IP → subdomain (numeric sort)
+│   ├── resolved_ips.txt          # Unique IPs (numerically sorted)
 │   └── httpx_results.txt         # Full httpx probe output
 │
 ├── phase3_asn/

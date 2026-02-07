@@ -492,27 +492,75 @@ phase2_dns_and_livehost() {
         -o "${DNS_DIR}/dnsx_resolved.txt" \
         2>>"$LOG_FILE" || true
 
-    # Extract just the hostnames that resolved
+    # Extract and sort into separate categorized files
     if [[ -f "${DNS_DIR}/dnsx_resolved.txt" ]]; then
+
+        # --- Unique subdomains (first column, deduplicated) ---
         awk '{print $1}' "${DNS_DIR}/dnsx_resolved.txt" \
             | sort -u > "${OUTPUT_DIR}/resolved_hosts.txt"
+
+        # --- A records: subdomain → IP mapping (sorted by subdomain) ---
+        grep '\[A\]' "${DNS_DIR}/dnsx_resolved.txt" 2>/dev/null \
+            | sort -t' ' -k1,1 -u > "${DNS_DIR}/dns_a_records.txt" || touch "${DNS_DIR}/dns_a_records.txt"
+
+        # --- AAAA records: subdomain → IPv6 mapping ---
+        grep '\[AAAA\]' "${DNS_DIR}/dnsx_resolved.txt" 2>/dev/null \
+            | sort -t' ' -k1,1 -u > "${DNS_DIR}/dns_aaaa_records.txt" || touch "${DNS_DIR}/dns_aaaa_records.txt"
+
+        # --- CNAME records: subdomain → canonical name mapping ---
+        grep '\[CNAME\]' "${DNS_DIR}/dnsx_resolved.txt" 2>/dev/null \
+            | sort -t' ' -k1,1 -u > "${DNS_DIR}/dns_cname_records.txt" || touch "${DNS_DIR}/dns_cname_records.txt"
+
+        # --- Subdomain-to-IP lookup table (clean TSV: subdomain<tab>ip) ---
+        grep '\[A\]' "${DNS_DIR}/dnsx_resolved.txt" 2>/dev/null \
+            | awk '{
+                sub = $1
+                for (i=2; i<=NF; i++) {
+                    if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                        printf "%s\t%s\n", sub, $i
+                    } else {
+                        # strip brackets from [ip]
+                        gsub(/[\[\]]/, "", $i)
+                        if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                            printf "%s\t%s\n", sub, $i
+                        }
+                    }
+                }
+            }' | sort -t$'\t' -k1,1 -u > "${DNS_DIR}/subdomain_ip_map.txt" || touch "${DNS_DIR}/subdomain_ip_map.txt"
+
+        # --- IP-to-subdomain reverse lookup (sorted by IP) ---
+        awk -F'\t' '{print $2 "\t" $1}' "${DNS_DIR}/subdomain_ip_map.txt" 2>/dev/null \
+            | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n -u \
+            > "${DNS_DIR}/ip_subdomain_map.txt" || touch "${DNS_DIR}/ip_subdomain_map.txt"
+
     else
         touch "${OUTPUT_DIR}/resolved_hosts.txt"
+        touch "${DNS_DIR}/dns_a_records.txt"
+        touch "${DNS_DIR}/dns_aaaa_records.txt"
+        touch "${DNS_DIR}/dns_cname_records.txt"
+        touch "${DNS_DIR}/subdomain_ip_map.txt"
+        touch "${DNS_DIR}/ip_subdomain_map.txt"
     fi
 
     local resolved_count
     resolved_count=$(count_lines "${OUTPUT_DIR}/resolved_hosts.txt")
-    print_status "DNS resolved: ${resolved_count} hosts have valid DNS records"
+    local a_count cname_count
+    a_count=$(count_lines "${DNS_DIR}/dns_a_records.txt")
+    cname_count=$(count_lines "${DNS_DIR}/dns_cname_records.txt")
+    print_status "DNS resolved: ${resolved_count} unique hosts"
+    print_status "  A records:     ${a_count}"
+    print_status "  CNAME records: ${cname_count}"
 
-    # --- Extract IPs from DNS results ---
+    # --- Extract unique IPs from DNS results ---
     print_progress "Extracting IP addresses from DNS results..."
 
     grep -oP '\d+\.\d+\.\d+\.\d+' "${DNS_DIR}/dnsx_resolved.txt" 2>/dev/null \
-        | sort -u > "${DNS_DIR}/resolved_ips.txt" || touch "${DNS_DIR}/resolved_ips.txt"
+        | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n -u \
+        > "${DNS_DIR}/resolved_ips.txt" || touch "${DNS_DIR}/resolved_ips.txt"
 
     local ip_count
     ip_count=$(count_lines "${DNS_DIR}/resolved_ips.txt")
-    print_status "Extracted ${ip_count} unique IP addresses from DNS"
+    print_status "Extracted ${ip_count} unique IP addresses (numerically sorted)"
 
     # --- Live Host Detection with httpx ---
     print_progress "Probing for live HTTP/HTTPS services with httpx..."
@@ -751,10 +799,63 @@ phase3_asn_discovery() {
     local total_ips
     total_ips=$(count_lines "${OUTPUT_DIR}/asn_ips.txt")
 
+    print_status "Total IPs from ASN expansion: ${total_ips}"
+
+    # --- Run httpx on ASN-discovered IPs ---
+    # Find IPs that weren't already covered by Phase 2's subdomain probing
+    print_progress "Probing ASN-discovered IPs with httpx for live services..."
+
+    local asn_new_ips="${ASN_DIR}/asn_new_ips.txt"
+    if [[ -f "${DNS_DIR}/resolved_ips.txt" ]]; then
+        comm -23 \
+            <(sort -u "${OUTPUT_DIR}/asn_ips.txt") \
+            <(sort -u "${DNS_DIR}/resolved_ips.txt") \
+            > "$asn_new_ips" 2>/dev/null || touch "$asn_new_ips"
+    else
+        cp "${OUTPUT_DIR}/asn_ips.txt" "$asn_new_ips"
+    fi
+
+    local new_ip_count
+    new_ip_count=$(count_lines "$asn_new_ips")
+
+    if [[ "$new_ip_count" -gt 0 ]]; then
+        print_status "  ${new_ip_count} IPs not yet probed — running httpx..."
+
+        httpx -l "$asn_new_ips" \
+            -silent \
+            -threads "$DEFAULT_HTTPX_THREADS" \
+            -status-code \
+            -title \
+            -tech-detect \
+            -content-length \
+            -follow-redirects \
+            -timeout 10 \
+            -retries 2 \
+            -o "${ASN_DIR}/httpx_asn_ips.txt" \
+            2>>"$LOG_FILE" || touch "${ASN_DIR}/httpx_asn_ips.txt"
+
+        local asn_live
+        asn_live=$(count_lines "${ASN_DIR}/httpx_asn_ips.txt")
+        print_status "  httpx found ${asn_live} live services on ASN IPs"
+
+        # Merge into master live hosts
+        if [[ "$asn_live" -gt 0 ]]; then
+            awk '{print $1}' "${ASN_DIR}/httpx_asn_ips.txt" \
+                | sort -u >> "${OUTPUT_DIR}/live_hosts.txt"
+            sort -u -o "${OUTPUT_DIR}/live_hosts.txt" "${OUTPUT_DIR}/live_hosts.txt"
+
+            cat "${ASN_DIR}/httpx_asn_ips.txt" >> "${OUTPUT_DIR}/live_hosts_full.txt"
+            sort -u -o "${OUTPUT_DIR}/live_hosts_full.txt" "${OUTPUT_DIR}/live_hosts_full.txt"
+        fi
+    else
+        print_status "  All ASN IPs were already covered by Phase 2. Skipping."
+    fi
+
     echo ""
     print_success "Phase 3 Complete: ${total_cidrs} CIDRs, ${total_ips} IPs enumerated"
     print_finding "CIDR ranges: ${OUTPUT_DIR}/asn_cidrs.txt"
     print_finding "IP addresses: ${OUTPUT_DIR}/asn_ips.txt"
+    print_finding "ASN IP httpx results: ${ASN_DIR}/httpx_asn_ips.txt"
     print_finding "ASN info: ${ASN_DIR}/asn_info.txt"
 
     # Copy org names to output dir for Phase 4
@@ -1500,8 +1601,180 @@ phase5_vulnerability_scan() {
 # FINAL REPORT GENERATION
 # ============================================================================
 
+generate_consolidated_file() {
+    # ================================================================
+    # FINAL CONSOLIDATED FILE
+    # Master file with every subdomain, its IPs, CNAMEs, and HTTP status
+    # Format: SUBDOMAIN | IPS | CNAME | HTTP_STATUS | TITLE
+    # ================================================================
+
+    print_progress "Generating consolidated master file..."
+
+    local master_file="${OUTPUT_DIR}/FINAL_CONSOLIDATED.txt"
+    local master_csv="${OUTPUT_DIR}/FINAL_CONSOLIDATED.csv"
+
+    # Header
+    printf "%-60s | %-18s | %-50s | %-6s | %s\n" \
+        "SUBDOMAIN" "IP(s)" "CNAME" "STATUS" "TITLE" > "$master_file"
+    printf "%s\n" "$(printf '─%.0s' {1..160})" >> "$master_file"
+
+    echo "subdomain,ip,cname,http_status,title,technologies" > "$master_csv"
+
+    # Build lookup tables in memory using temp files
+    local tmp_ip_map="/tmp/recon_ip_map_$$.txt"
+    local tmp_cname_map="/tmp/recon_cname_map_$$.txt"
+    local tmp_httpx_map="/tmp/recon_httpx_map_$$.txt"
+
+    # IP map: subdomain → IPs (comma-separated if multiple)
+    if [[ -f "${DNS_DIR}/dns_a_records.txt" ]]; then
+        awk '{
+            sub = $1
+            for (i=2; i<=NF; i++) {
+                gsub(/[\[\]]/, "", $i)
+                if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                    if (sub in ips) ips[sub] = ips[sub] "," $i
+                    else ips[sub] = $i
+                }
+            }
+        } END {
+            for (s in ips) print s "\t" ips[s]
+        }' "${DNS_DIR}/dns_a_records.txt" | sort > "$tmp_ip_map" 2>/dev/null || touch "$tmp_ip_map"
+    else
+        touch "$tmp_ip_map"
+    fi
+
+    # CNAME map: subdomain → cname target
+    if [[ -f "${DNS_DIR}/dns_cname_records.txt" ]]; then
+        awk '{
+            sub = $1
+            for (i=2; i<=NF; i++) {
+                gsub(/[\[\]]/, "", $i)
+                if ($i != "[CNAME]" && $i != "CNAME" && $i ~ /\./) {
+                    print sub "\t" $i
+                    break
+                }
+            }
+        }' "${DNS_DIR}/dns_cname_records.txt" | sort -u > "$tmp_cname_map" 2>/dev/null || touch "$tmp_cname_map"
+    else
+        touch "$tmp_cname_map"
+    fi
+
+    # httpx map: hostname → status,title,tech
+    if [[ -f "${OUTPUT_DIR}/live_hosts_full.txt" ]]; then
+        awk '{
+            url = $1
+            # Extract hostname from URL
+            gsub(/https?:\/\//, "", url)
+            gsub(/\/.*/, "", url)
+            gsub(/:.*/, "", url)
+
+            status = ""
+            title = ""
+            tech = ""
+            for (i=2; i<=NF; i++) {
+                if ($i ~ /^\[[0-9]+\]$/) {
+                    gsub(/[\[\]]/, "", $i)
+                    status = $i
+                } else if (status != "" && title == "") {
+                    gsub(/[\[\]]/, "", $i)
+                    title = $i
+                }
+            }
+            if (!(url in seen)) {
+                print url "\t" status "\t" title
+                seen[url] = 1
+            }
+        }' "${OUTPUT_DIR}/live_hosts_full.txt" | sort -u > "$tmp_httpx_map" 2>/dev/null || touch "$tmp_httpx_map"
+    else
+        touch "$tmp_httpx_map"
+    fi
+
+    # Iterate all subdomains and build the consolidated file
+    local count=0
+    while IFS= read -r subdomain || [[ -n "$subdomain" ]]; do
+        [[ -z "$subdomain" ]] && continue
+        ((count++)) || true
+
+        # Lookup IP
+        local ips
+        ips=$(grep -m1 "^${subdomain}	" "$tmp_ip_map" 2>/dev/null | cut -f2 || echo "-")
+        [[ -z "$ips" ]] && ips="-"
+
+        # Lookup CNAME
+        local cname
+        cname=$(grep -m1 "^${subdomain}	" "$tmp_cname_map" 2>/dev/null | cut -f2 || echo "-")
+        [[ -z "$cname" ]] && cname="-"
+
+        # Lookup HTTP status
+        local http_status http_title
+        local httpx_line
+        httpx_line=$(grep -m1 "^${subdomain}	" "$tmp_httpx_map" 2>/dev/null || echo "")
+        if [[ -n "$httpx_line" ]]; then
+            http_status=$(echo "$httpx_line" | cut -f2)
+            http_title=$(echo "$httpx_line" | cut -f3)
+        else
+            http_status="-"
+            http_title="-"
+        fi
+        [[ -z "$http_status" ]] && http_status="-"
+        [[ -z "$http_title" ]] && http_title="-"
+
+        # Write to text file
+        printf "%-60s | %-18s | %-50s | %-6s | %s\n" \
+            "$subdomain" "$ips" "$cname" "$http_status" "$http_title" >> "$master_file"
+
+        # Write to CSV (escape commas in fields)
+        local csv_title="${http_title//,/;}"
+        echo "${subdomain},${ips},${cname},${http_status},${csv_title}" >> "$master_csv"
+
+    done < "${OUTPUT_DIR}/subdomains.txt"
+
+    # Also add ASN-discovered IPs that aren't subdomains
+    if [[ -f "${OUTPUT_DIR}/asn_ips.txt" ]]; then
+        echo "" >> "$master_file"
+        printf "%s\n" "$(printf '─%.0s' {1..160})" >> "$master_file"
+        printf "%-60s\n" "ASN-DISCOVERED IPs (not mapped to subdomains above)" >> "$master_file"
+        printf "%s\n" "$(printf '─%.0s' {1..160})" >> "$master_file"
+
+        while IFS= read -r ip || [[ -n "$ip" ]]; do
+            [[ -z "$ip" ]] && continue
+
+            # Check if this IP is already in our subdomain map
+            if ! grep -q "$ip" "$tmp_ip_map" 2>/dev/null; then
+                local ip_http_status ip_http_title
+                local ip_httpx_line
+                ip_httpx_line=$(grep -m1 "^${ip}	" "$tmp_httpx_map" 2>/dev/null || echo "")
+                if [[ -n "$ip_httpx_line" ]]; then
+                    ip_http_status=$(echo "$ip_httpx_line" | cut -f2)
+                    ip_http_title=$(echo "$ip_httpx_line" | cut -f3)
+                else
+                    ip_http_status="-"
+                    ip_http_title="-"
+                fi
+                [[ -z "$ip_http_status" ]] && ip_http_status="-"
+                [[ -z "$ip_http_title" ]] && ip_http_title="-"
+
+                printf "%-60s | %-18s | %-50s | %-6s | %s\n" \
+                    "$ip" "$ip" "-" "$ip_http_status" "$ip_http_title" >> "$master_file"
+
+                echo "${ip},${ip},-,${ip_http_status},${ip_http_title}" >> "$master_csv"
+            fi
+        done < "${OUTPUT_DIR}/asn_ips.txt"
+    fi
+
+    # Clean up temp files
+    rm -f "$tmp_ip_map" "$tmp_cname_map" "$tmp_httpx_map" 2>/dev/null || true
+
+    print_success "Consolidated file: ${count} subdomains + ASN IPs"
+    print_finding "Master TXT: ${master_file}"
+    print_finding "Master CSV: ${master_csv}"
+}
+
 generate_report() {
     phase_banner "6" "REPORT GENERATION"
+
+    # Generate consolidated master file first
+    generate_consolidated_file
 
     local report_file="${OUTPUT_DIR}/RECON_REPORT.txt"
 
@@ -1523,6 +1796,10 @@ generate_report() {
         echo ""
         echo "  Subdomains discovered:     $(count_lines "${OUTPUT_DIR}/subdomains.txt" 2>/dev/null || echo 0)"
         echo "  DNS resolved hosts:        $(count_lines "${OUTPUT_DIR}/resolved_hosts.txt" 2>/dev/null || echo 0)"
+        echo "    ├─ A records:            $(count_lines "${DNS_DIR}/dns_a_records.txt" 2>/dev/null || echo 0)"
+        echo "    ├─ AAAA records:         $(count_lines "${DNS_DIR}/dns_aaaa_records.txt" 2>/dev/null || echo 0)"
+        echo "    └─ CNAME records:        $(count_lines "${DNS_DIR}/dns_cname_records.txt" 2>/dev/null || echo 0)"
+        echo "  Unique IPs from DNS:       $(count_lines "${DNS_DIR}/resolved_ips.txt" 2>/dev/null || echo 0)"
         echo "  Live HTTP hosts:           $(count_lines "${OUTPUT_DIR}/live_hosts.txt" 2>/dev/null || echo 0)"
         echo "  ASN CIDR ranges:           $(count_lines "${OUTPUT_DIR}/asn_cidrs.txt" 2>/dev/null || echo 0)"
         echo "  Enumerated IPs:            $(count_lines "${OUTPUT_DIR}/asn_ips.txt" 2>/dev/null || echo 0)"
@@ -1541,6 +1818,17 @@ generate_report() {
             echo "    Info:     $(count_lines "${VULN_DIR}/nuclei_info.txt" 2>/dev/null || echo 0)"
             echo ""
         fi
+
+        echo "============================================================================"
+        echo "  CONSOLIDATED MASTER LIST (Subdomain | IP | CNAME | HTTP Status)"
+        echo "============================================================================"
+        echo ""
+        if [[ -f "${OUTPUT_DIR}/FINAL_CONSOLIDATED.txt" ]]; then
+            cat "${OUTPUT_DIR}/FINAL_CONSOLIDATED.txt"
+        else
+            echo "  Consolidated file not generated."
+        fi
+        echo ""
 
         echo "============================================================================"
         echo "  CRITICAL & HIGH FINDINGS (DETAILS)"
@@ -1576,6 +1864,41 @@ generate_report() {
             cat "${OUTPUT_DIR}/live_hosts_full.txt"
         else
             echo "  No live hosts detected."
+        fi
+        echo ""
+
+        echo "============================================================================"
+        echo "  DNS RECORDS BREAKDOWN"
+        echo "============================================================================"
+        echo ""
+        echo "── A Records (Subdomain → IP) ──"
+        if [[ -f "${DNS_DIR}/dns_a_records.txt" ]] && [[ $(count_lines "${DNS_DIR}/dns_a_records.txt") -gt 0 ]]; then
+            cat "${DNS_DIR}/dns_a_records.txt"
+        else
+            echo "  No A records."
+        fi
+        echo ""
+        echo "── CNAME Records (Subdomain → Canonical Name) ──"
+        if [[ -f "${DNS_DIR}/dns_cname_records.txt" ]] && [[ $(count_lines "${DNS_DIR}/dns_cname_records.txt") -gt 0 ]]; then
+            cat "${DNS_DIR}/dns_cname_records.txt"
+        else
+            echo "  No CNAME records."
+        fi
+        echo ""
+        echo "── Subdomain → IP Mapping ──"
+        if [[ -f "${DNS_DIR}/subdomain_ip_map.txt" ]] && [[ $(count_lines "${DNS_DIR}/subdomain_ip_map.txt") -gt 0 ]]; then
+            echo "SUBDOMAIN	IP_ADDRESS"
+            cat "${DNS_DIR}/subdomain_ip_map.txt"
+        else
+            echo "  No mapping data."
+        fi
+        echo ""
+        echo "── IP → Subdomain Reverse Mapping ──"
+        if [[ -f "${DNS_DIR}/ip_subdomain_map.txt" ]] && [[ $(count_lines "${DNS_DIR}/ip_subdomain_map.txt") -gt 0 ]]; then
+            echo "IP_ADDRESS	SUBDOMAIN"
+            cat "${DNS_DIR}/ip_subdomain_map.txt"
+        else
+            echo "  No reverse mapping data."
         fi
         echo ""
 
