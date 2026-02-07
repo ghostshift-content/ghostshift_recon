@@ -120,7 +120,7 @@ print_success() {
 }
 
 print_error() {
-    echo -e "${CROSS} $*"
+    echo -e "${CROSS} $*" >&2
     log "ERROR" "$*"
 }
 
@@ -2057,7 +2057,7 @@ phase7_js_security_scan() {
             | sort -u \
             | while IFS= read -r token || [[ -n "$token" ]]; do
                 [[ -z "$token" ]] && continue
-                echo "[HIGH] ${js_url} | token=$(mask_secret_value "$token")" >> "$findings"
+                echo "[HIGH] source_url=${js_url} | source_domain=$(extract_domain_from_url "$js_url") | token=$(mask_secret_value "$token")" >> "$findings"
             done
 
         # Suspicious hardcoded key-value assignments (reduced-noise)
@@ -2066,7 +2066,7 @@ phase7_js_security_scan() {
             | head -n 20 \
             | while IFS= read -r match_line || [[ -n "$match_line" ]]; do
                 [[ -z "$match_line" ]] && continue
-                echo "[MEDIUM] ${js_url} | ${match_line}" >> "$findings"
+                echo "[MEDIUM] source_url=${js_url} | source_domain=$(extract_domain_from_url "$js_url") | ${match_line}" >> "$findings"
             done
 
         # S3 endpoint extraction (for takeover/in-use triage)
@@ -2105,7 +2105,7 @@ phase7_js_security_scan() {
             | sort -u \
             | while IFS= read -r token || [[ -n "$token" ]]; do
                 [[ -z "$token" ]] && continue
-                echo "[HIGH][ORIGIN] ${origin_url} | token=$(mask_secret_value "$token")" >> "$findings"
+                echo "[HIGH][ORIGIN] source_url=${origin_url} | source_domain=$(extract_domain_from_url "$origin_url") | token=$(mask_secret_value "$token")" >> "$findings"
             done
 
         # Suspicious hardcoded key-value assignments (reduced-noise)
@@ -2114,7 +2114,7 @@ phase7_js_security_scan() {
             | head -n 20 \
             | while IFS= read -r match_line || [[ -n "$match_line" ]]; do
                 [[ -z "$match_line" ]] && continue
-                echo "[MEDIUM][ORIGIN] ${origin_url} | ${match_line}" >> "$findings"
+                echo "[MEDIUM][ORIGIN] source_url=${origin_url} | source_domain=$(extract_domain_from_url "$origin_url") | ${match_line}" >> "$findings"
             done
 
         # S3 endpoint extraction
@@ -2135,21 +2135,27 @@ phase7_js_security_scan() {
             [[ -z "$s3_ep" ]] && continue
 
             local s3_url body tmp_code
+            local source_urls source_domains
             if [[ "$s3_ep" == http* ]]; then
                 s3_url="$s3_ep"
             else
                 s3_url="https://${s3_ep}"
             fi
 
+            source_urls=$(awk -F'\t' -v ep="$s3_ep" '$1==ep {print $2}' "$s3_refs" 2>/dev/null | sort -u | paste -sd, -)
+            source_domains=$(awk -F'\t' -v ep="$s3_ep" '$1==ep {print $2}' "$s3_refs" 2>/dev/null \
+                | sed -e 's|https\?://||' -e 's|/.*||' -e 's|:.*||' \
+                | sort -u | paste -sd, -)
+
             body=$(curl -sS -L --max-time 15 --connect-timeout 6 "$s3_url" 2>>"$LOG_FILE" || true)
             tmp_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 --connect-timeout 6 "$s3_url" 2>>"$LOG_FILE" || echo "000")
 
             if echo "$body" | grep -qi 'NoSuchBucket'; then
-                echo "${s3_ep} | status=${tmp_code} | signal=NoSuchBucket" >> "$s3_claimable"
+                echo "${s3_ep} | status=${tmp_code} | signal=NoSuchBucket | source_domains=${source_domains} | source_urls=${source_urls}" >> "$s3_claimable"
             elif echo "$body" | grep -Eqi 'AccessDenied|ListBucketResult|PermanentRedirect|x-amz-bucket-region'; then
-                echo "${s3_ep} | status=${tmp_code} | signal=InUse" >> "$s3_in_use"
+                echo "${s3_ep} | status=${tmp_code} | signal=InUse | source_domains=${source_domains} | source_urls=${source_urls}" >> "$s3_in_use"
             elif [[ "$tmp_code" == "200" ]] || [[ "$tmp_code" == "403" ]] || [[ "$tmp_code" == "301" ]] || [[ "$tmp_code" == "302" ]]; then
-                echo "${s3_ep} | status=${tmp_code} | signal=LikelyInUse" >> "$s3_in_use"
+                echo "${s3_ep} | status=${tmp_code} | signal=LikelyInUse | source_domains=${source_domains} | source_urls=${source_urls}" >> "$s3_in_use"
             fi
         done
     fi
@@ -2644,6 +2650,7 @@ usage() {
     echo "      --phase N            Run only specific phase (1-8, or 4b/4c)"
     echo "      --skip-nuclei        Skip vulnerability scanning (Phase 5)"
     echo "      --nuclei-severity S  Nuclei severity filter (default: info,low,medium,high,critical)"
+    echo "      --silent             Quiet mode (suppress normal stdout; keep logs/files)"
     echo "  -h, --help               Show this help message"
     echo ""
     echo -e "${BOLD}Examples:${NC}"
@@ -2668,9 +2675,8 @@ usage() {
 # ============================================================================
 
 main() {
-    banner
-
     # Parse arguments
+    SILENT_MODE=false
     TARGET_FILE=""
     OUTPUT_DIR=""
     RATE_LIMIT="$DEFAULT_RATE_LIMIT"
@@ -2730,6 +2736,10 @@ main() {
             --nuclei-severity)
                 NUCLEI_SEVERITY="$2"
                 shift 2
+                ;;
+            --silent)
+                SILENT_MODE=true
+                shift
                 ;;
             -h|--help)
                 usage
@@ -2797,6 +2807,12 @@ main() {
     # Initialize logging
     log_init
 
+    if [[ "$SILENT_MODE" == true ]]; then
+        exec >/dev/null
+    fi
+
+    banner
+
     # Print scan config
     echo -e "${BOLD}${WHITE}Scan Configuration:${NC}"
     echo -e "  Target file:    ${TARGET_FILE}"
@@ -2808,6 +2824,7 @@ main() {
     echo -e "  Crawl depth:    ${URL_CRAWL_DEPTH}"
     echo -e "  Ports:          ${NAABU_TOP_PORTS:+top-${NAABU_TOP_PORTS}}${NAABU_TOP_PORTS:-${DEFAULT_PORTS}}"
     echo -e "  Skip nuclei:    ${SKIP_NUCLEI}"
+    echo -e "  Silent mode:    ${SILENT_MODE}"
     echo ""
 
     log "INFO" "Scan started with config: domains=${domain_count}, rate_limit=${RATE_LIMIT}, threads=${THREADS}"
