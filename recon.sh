@@ -37,6 +37,8 @@ DEFAULT_NUCLEI_BULK_SIZE=25     # nuclei bulk size
 DEFAULT_NUCLEI_CONCURRENCY=10   # nuclei template concurrency
 DEFAULT_ENUM_JOBS=4             # parallel root-domain enumeration workers
 DEFAULT_URL_CRAWL_DEPTH=2       # katana/hakrawler depth
+DEFAULT_JS_MAX_FILES=300        # maximum JS files to fetch for secret checks
+DEFAULT_CACHE_TEST_URLS=150     # maximum parameterized JS URLs for cache tests
 DEFAULT_PORTS="80,443,8080,8443,8000,8888,9090,3000,5000,5443"
 NAABU_TOP_PORTS=""              # if set, use top-ports instead of port list
 
@@ -256,6 +258,7 @@ OPTIONAL_TOOLS=(
     "waybackurls"
     "katana"
     "hakrawler"
+    "subjs"
 )
 
 check_tools() {
@@ -396,6 +399,72 @@ scope_filter_urls_file() {
     done < "$input_file"
     sort -u -o "$output_file" "$output_file" 2>/dev/null || true
     delete_empty_lines "$output_file"
+}
+
+is_useful_host() {
+    local host="$1"
+    [[ -z "$host" ]] && return 1
+
+    if [[ -f "${OUTPUT_DIR}/resolved_hosts.txt" ]] && grep -qix "$host" "${OUTPUT_DIR}/resolved_hosts.txt" 2>/dev/null; then
+        return 0
+    fi
+    if [[ -f "${OUTPUT_DIR}/subdomains.txt" ]] && grep -qix "$host" "${OUTPUT_DIR}/subdomains.txt" 2>/dev/null; then
+        return 0
+    fi
+    if is_domain_in_scope "$host"; then
+        return 0
+    fi
+    return 1
+}
+
+mask_secret_value() {
+    local secret="$1"
+    local len=${#secret}
+    if [[ "$len" -le 10 ]]; then
+        echo "$secret"
+        return
+    fi
+    local start end
+    start="${secret:0:4}"
+    end="${secret: -4}"
+    echo "${start}****${end}"
+}
+
+url_with_extra_param() {
+    local url="$1"
+    local param_name="$2"
+    local param_value="$3"
+    if [[ "$url" == *\?* ]]; then
+        echo "${url}&${param_name}=${param_value}"
+    else
+        echo "${url}?${param_name}=${param_value}"
+    fi
+}
+
+header_get_ci() {
+    local header_file="$1"
+    local header_name="$2"
+    awk -v key="$(echo "$header_name" | tr '[:upper:]' '[:lower:]')" '
+    BEGIN { FS=":" }
+    {
+      line_key=tolower($1)
+      if (line_key==key) {
+        sub(/^[^:]*:[[:space:]]*/, "", $0)
+        print $0
+        exit
+      }
+    }' "$header_file" 2>/dev/null
+}
+
+file_sha256() {
+    local file="$1"
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$file" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
+    else
+        wc -c < "$file" 2>/dev/null | tr -d ' '
+    fi
 }
 
 is_ip() {
@@ -1881,6 +1950,284 @@ phase5_vulnerability_scan() {
 }
 
 # ============================================================================
+# PHASE 6: JAVASCRIPT URL DISCOVERY
+# ============================================================================
+
+phase6_js_discovery() {
+    phase_banner "6" "JAVASCRIPT URL DISCOVERY"
+
+    mkdir -p "$JS_DIR" "$VULN_DIR"
+
+    local js_raw="${JS_DIR}/js_urls_raw.txt"
+    local js_useful="${JS_DIR}/js_urls_useful.txt"
+    local js_params="${JS_DIR}/js_urls_params.txt"
+    local js_sources="${JS_DIR}/js_sources.txt"
+
+    : > "$js_raw"
+    : > "$js_useful"
+    : > "$js_params"
+    : > "$js_sources"
+
+    # Build URL intel corpus first (archive + optional crawlers)
+    collect_url_intelligence
+
+    # Source hosts from root + discovered subdomains
+    if [[ -f "$TARGET_FILE" ]]; then
+        grep -v '^\s*#' "$TARGET_FILE" | grep -v '^\s*$' >> "$js_sources" 2>/dev/null || true
+    fi
+    if [[ -f "${OUTPUT_DIR}/subdomains.txt" ]]; then
+        cat "${OUTPUT_DIR}/subdomains.txt" >> "$js_sources"
+    fi
+    sort -u -o "$js_sources" "$js_sources"
+    delete_empty_lines "$js_sources"
+
+    # Harvest JS from URL intel
+    if [[ -f "${VULN_DIR}/url_intel_scoped.txt" ]]; then
+        grep -Ei '\.m?js([?#].*)?$' "${VULN_DIR}/url_intel_scoped.txt" >> "$js_raw" 2>/dev/null || true
+    fi
+
+    # Additional JS discovery from subjs (if available)
+    if command -v subjs &>/dev/null && [[ -f "$js_sources" ]]; then
+        subjs -i "$js_sources" >> "$js_raw" 2>>"$LOG_FILE" || true
+    fi
+
+    # Extra quick pass from gau/wayback directly on discovered hosts
+    if command -v waybackurls &>/dev/null && [[ -f "$js_sources" ]]; then
+        waybackurls < "$js_sources" | grep -Ei '\.m?js([?#].*)?$' >> "$js_raw" 2>>"$LOG_FILE" || true
+    fi
+    if command -v gau &>/dev/null && [[ -f "$js_sources" ]]; then
+        gau --subs --providers wayback,commoncrawl,otx,urlscan -threads "$DEFAULT_THREADS" \
+            < "$js_sources" \
+            | grep -Ei '\.m?js([?#].*)?$' >> "$js_raw" 2>>"$LOG_FILE" || true
+    fi
+
+    sort -u -o "$js_raw" "$js_raw" 2>/dev/null || true
+    delete_empty_lines "$js_raw"
+
+    # Filter to useful hosts only
+    while IFS= read -r url || [[ -n "$url" ]]; do
+        [[ -z "$url" ]] && continue
+        local host
+        host=$(extract_domain_from_url "$url")
+        if is_useful_host "$host"; then
+            echo "$url" >> "$js_useful"
+        fi
+    done < "$js_raw"
+    sort -u -o "$js_useful" "$js_useful"
+    delete_empty_lines "$js_useful"
+
+    grep '?' "$js_useful" | sort -u > "$js_params" 2>/dev/null || touch "$js_params"
+
+    print_status "Raw JS URLs: $(count_lines "$js_raw")"
+    print_status "Useful scoped JS URLs: $(count_lines "$js_useful")"
+    print_status "Parameterized JS URLs: $(count_lines "$js_params")"
+    print_finding "JS URL list: ${js_useful}"
+}
+
+# ============================================================================
+# PHASE 7: JS HARDCODED CREDENTIALS + S3 TAKEOVER SIGNALS
+# ============================================================================
+
+phase7_js_security_scan() {
+    phase_banner "7" "JS HARDCODED CREDS + S3 ANALYSIS"
+
+    mkdir -p "$JS_DIR"
+
+    local js_useful="${JS_DIR}/js_urls_useful.txt"
+    if [[ ! -f "$js_useful" ]] || [[ $(count_lines "$js_useful") -eq 0 ]]; then
+        print_warning "No JS URL inventory found. Running Phase 6 first..."
+        phase6_js_discovery
+    fi
+
+    if [[ ! -f "$js_useful" ]] || [[ $(count_lines "$js_useful") -eq 0 ]]; then
+        print_warning "No JS URLs available after discovery. Skipping Phase 7."
+        touch "${JS_DIR}/js_secret_findings.txt"
+        touch "${JS_DIR}/js_s3_claimable_candidates.txt"
+        touch "${JS_DIR}/js_s3_in_use.txt"
+        return
+    fi
+
+    local findings="${JS_DIR}/js_secret_findings.txt"
+    local s3_refs="${JS_DIR}/js_s3_endpoints_raw.txt"
+    local s3_claimable="${JS_DIR}/js_s3_claimable_candidates.txt"
+    local s3_in_use="${JS_DIR}/js_s3_in_use.txt"
+    local fetch_errors="${JS_DIR}/js_fetch_errors.txt"
+    local tmp_dir="${JS_DIR}/tmp_js_fetch"
+
+    : > "$findings"
+    : > "$s3_refs"
+    : > "$s3_claimable"
+    : > "$s3_in_use"
+    : > "$fetch_errors"
+    mkdir -p "$tmp_dir"
+
+    local processed=0
+    while IFS= read -r js_url || [[ -n "$js_url" ]]; do
+        [[ -z "$js_url" ]] && continue
+        ((processed++))
+        if [[ "$processed" -gt "$DEFAULT_JS_MAX_FILES" ]]; then
+            break
+        fi
+
+        local js_file
+        js_file="${tmp_dir}/js_${processed}.txt"
+
+        if ! curl -sS -L --max-time 20 --connect-timeout 8 "$js_url" -o "$js_file" 2>>"$LOG_FILE"; then
+            echo "$js_url" >> "$fetch_errors"
+            continue
+        fi
+
+        # High-confidence token patterns
+        grep -Eo 'AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|ghp_[0-9A-Za-z]{36}|xox[baprs]-[0-9A-Za-z-]{10,80}' "$js_file" 2>/dev/null \
+            | sort -u \
+            | while IFS= read -r token || [[ -n "$token" ]]; do
+                [[ -z "$token" ]] && continue
+                echo "[HIGH] ${js_url} | token=$(mask_secret_value "$token")" >> "$findings"
+            done
+
+        # Suspicious hardcoded key-value assignments (reduced-noise)
+        grep -Ein '(api[_-]?key|access[_-]?key|secret|token|password|passwd|client[_-]?secret)[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9_./+=:-]{12,120}["'"'"']' "$js_file" 2>/dev/null \
+            | grep -Eiv 'example|sample|dummy|test|changeme|placeholder|your[_-]?key' \
+            | head -n 20 \
+            | while IFS= read -r match_line || [[ -n "$match_line" ]]; do
+                [[ -z "$match_line" ]] && continue
+                echo "[MEDIUM] ${js_url} | ${match_line}" >> "$findings"
+            done
+
+        # S3 endpoint extraction (for takeover/in-use triage)
+        grep -Eoi '([a-z0-9.-]+\.s3[.-][a-z0-9-]+\.amazonaws\.com|[a-z0-9.-]+\.s3\.amazonaws\.com|s3\.amazonaws\.com/[a-z0-9.-]+|[a-z0-9.-]+\.s3-website[.-][a-z0-9-]+\.amazonaws\.com)' "$js_file" 2>/dev/null \
+            | sort -u \
+            | while IFS= read -r s3_ep || [[ -n "$s3_ep" ]]; do
+                [[ -z "$s3_ep" ]] && continue
+                echo -e "${s3_ep}\t${js_url}" >> "$s3_refs"
+            done
+    done < "$js_useful"
+
+    sort -u -o "$findings" "$findings" 2>/dev/null || true
+    sort -u -o "$s3_refs" "$s3_refs" 2>/dev/null || true
+
+    # Classify S3 endpoints by safe HTTP signals
+    if [[ -f "$s3_refs" ]] && [[ $(count_lines "$s3_refs") -gt 0 ]]; then
+        cut -f1 "$s3_refs" | sort -u | while IFS= read -r s3_ep || [[ -n "$s3_ep" ]]; do
+            [[ -z "$s3_ep" ]] && continue
+
+            local s3_url body tmp_code
+            if [[ "$s3_ep" == http* ]]; then
+                s3_url="$s3_ep"
+            else
+                s3_url="https://${s3_ep}"
+            fi
+
+            body=$(curl -sS -L --max-time 15 --connect-timeout 6 "$s3_url" 2>>"$LOG_FILE" || true)
+            tmp_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 --connect-timeout 6 "$s3_url" 2>>"$LOG_FILE" || echo "000")
+
+            if echo "$body" | grep -qi 'NoSuchBucket'; then
+                echo "${s3_ep} | status=${tmp_code} | signal=NoSuchBucket" >> "$s3_claimable"
+            elif echo "$body" | grep -Eqi 'AccessDenied|ListBucketResult|PermanentRedirect|x-amz-bucket-region'; then
+                echo "${s3_ep} | status=${tmp_code} | signal=InUse" >> "$s3_in_use"
+            elif [[ "$tmp_code" == "200" ]] || [[ "$tmp_code" == "403" ]] || [[ "$tmp_code" == "301" ]] || [[ "$tmp_code" == "302" ]]; then
+                echo "${s3_ep} | status=${tmp_code} | signal=LikelyInUse" >> "$s3_in_use"
+            fi
+        done
+    fi
+
+    sort -u -o "$s3_claimable" "$s3_claimable" 2>/dev/null || true
+    sort -u -o "$s3_in_use" "$s3_in_use" 2>/dev/null || true
+
+    print_status "JS files fetched: $((processed < DEFAULT_JS_MAX_FILES ? processed : DEFAULT_JS_MAX_FILES))"
+    print_status "Secret findings: $(count_lines "$findings")"
+    print_status "S3 claimable candidates: $(count_lines "$s3_claimable")"
+    print_status "S3 in-use endpoints: $(count_lines "$s3_in_use")"
+    print_finding "Secret report: ${findings}"
+}
+
+# ============================================================================
+# PHASE 8: SAFE CACHE-POISONING SIGNAL CHECKS (PARAMETERIZED JS URLs)
+# ============================================================================
+
+phase8_cache_poisoning_safe() {
+    phase_banner "8" "SAFE CACHE-POISONING CHECKS (.JS WITH PARAMS)"
+
+    mkdir -p "$JS_DIR"
+
+    local js_params="${JS_DIR}/js_urls_params.txt"
+    if [[ ! -f "$js_params" ]] || [[ $(count_lines "$js_params") -eq 0 ]]; then
+        print_warning "No parameterized JS URL inventory found. Running Phase 6 first..."
+        phase6_js_discovery
+    fi
+
+    if [[ ! -f "$js_params" ]] || [[ $(count_lines "$js_params") -eq 0 ]]; then
+        print_warning "No parameterized JS URLs available. Skipping Phase 8."
+        touch "${JS_DIR}/js_cache_poisoning_safe_report.txt"
+        return
+    fi
+
+    local report="${JS_DIR}/js_cache_poisoning_safe_report.txt"
+    local tested_file="${JS_DIR}/js_cache_poisoning_tested.txt"
+    : > "$report"
+    : > "$tested_file"
+
+    local tested=0
+    while IFS= read -r url || [[ -n "$url" ]]; do
+        [[ -z "$url" ]] && continue
+        ((tested++))
+        if [[ "$tested" -gt "$DEFAULT_CACHE_TEST_URLS" ]]; then
+            break
+        fi
+
+        local marker hdr1 hdr2 body1 body2 probe_url cache_control age xcache cf_cache_status hash1 hash2
+        marker="cacheprobe$RANDOM$RANDOM"
+        hdr1="${JS_DIR}/.hdr1_${tested}.tmp"
+        hdr2="${JS_DIR}/.hdr2_${tested}.tmp"
+        body1="${JS_DIR}/.body1_${tested}.tmp"
+        body2="${JS_DIR}/.body2_${tested}.tmp"
+        probe_url=$(url_with_extra_param "$url" "__cacheprobe" "$marker")
+
+        curl -sS -L -D "$hdr1" -o "$body1" --max-time 20 --connect-timeout 8 "$url" 2>>"$LOG_FILE" || true
+        curl -sS -L -D "$hdr2" -o "$body2" --max-time 20 --connect-timeout 8 \
+            -H "X-Forwarded-Host: ${marker}.invalid" \
+            "$probe_url" 2>>"$LOG_FILE" || true
+
+        hash1=$(file_sha256 "$body1")
+        hash2=$(file_sha256 "$body2")
+
+        cache_control=$(header_get_ci "$hdr1" "Cache-Control")
+        age=$(header_get_ci "$hdr1" "Age")
+        xcache=$(header_get_ci "$hdr1" "X-Cache")
+        cf_cache_status=$(header_get_ci "$hdr1" "CF-Cache-Status")
+
+        local cache_signal reflected_marker verdict
+        cache_signal="no"
+        reflected_marker="no"
+        verdict="low-signal"
+
+        if echo "${cache_control} ${age} ${xcache} ${cf_cache_status}" | grep -Eqi 'public|max-age|s-maxage|hit|miss|cache'; then
+            cache_signal="yes"
+        fi
+
+        if grep -qi "$marker" "$body2" 2>/dev/null || grep -qi "$marker" "$hdr2" 2>/dev/null; then
+            reflected_marker="yes"
+        fi
+
+        if [[ "$cache_signal" == "yes" && "$reflected_marker" == "yes" ]]; then
+            verdict="potential-unkeyed-input-cache-risk"
+            echo "[POTENTIAL] ${url} | probe=${probe_url} | cache=${cache_control:-none} | x-cache=${xcache:-none} | cf-cache=${cf_cache_status:-none} | body-hash-changed=$([[ "$hash1" == "$hash2" ]] && echo "no" || echo "yes")" >> "$report"
+        fi
+
+        echo "${url} | cache_signal=${cache_signal} | reflected_marker=${reflected_marker} | verdict=${verdict}" >> "$tested_file"
+
+        rm -f "$hdr1" "$hdr2" "$body1" "$body2" 2>/dev/null || true
+    done < "$js_params"
+
+    sort -u -o "$report" "$report" 2>/dev/null || true
+    sort -u -o "$tested_file" "$tested_file" 2>/dev/null || true
+
+    print_status "Cache-safety test URLs processed: $((tested < DEFAULT_CACHE_TEST_URLS ? tested : DEFAULT_CACHE_TEST_URLS))"
+    print_status "Potential cache-risk signals: $(count_lines "$report")"
+    print_finding "Safe cache check report: ${report}"
+}
+
+# ============================================================================
 # FINAL REPORT GENERATION
 # ============================================================================
 
@@ -2058,7 +2405,7 @@ generate_consolidated_file() {
 }
 
 generate_report() {
-    phase_banner "6" "REPORT GENERATION"
+    phase_banner "9" "REPORT GENERATION"
 
     # Generate consolidated master file first
     generate_consolidated_file
@@ -2097,6 +2444,10 @@ generate_report() {
         echo "  URL intel endpoints:       $(count_lines "${VULN_DIR}/url_intel_scoped.txt" 2>/dev/null || echo 0)"
         echo "    ├─ Parameterized URLs:   $(count_lines "${VULN_DIR}/url_intel_params.txt" 2>/dev/null || echo 0)"
         echo "    └─ JavaScript URLs:      $(count_lines "${VULN_DIR}/url_intel_js.txt" 2>/dev/null || echo 0)"
+        echo "  Useful JS URLs:            $(count_lines "${JS_DIR}/js_urls_useful.txt" 2>/dev/null || echo 0)"
+        echo "  JS secret findings:        $(count_lines "${JS_DIR}/js_secret_findings.txt" 2>/dev/null || echo 0)"
+        echo "  S3 claimable candidates:   $(count_lines "${JS_DIR}/js_s3_claimable_candidates.txt" 2>/dev/null || echo 0)"
+        echo "  JS cache-risk signals:     $(count_lines "${JS_DIR}/js_cache_poisoning_safe_report.txt" 2>/dev/null || echo 0)"
         echo ""
 
         if [[ -f "${VULN_DIR}/nuclei_results.jsonl" ]]; then
@@ -2206,6 +2557,32 @@ generate_report() {
         echo ""
 
         echo "============================================================================"
+        echo "  JAVASCRIPT SECURITY ANALYSIS"
+        echo "============================================================================"
+        echo ""
+        echo "── Secret Findings (high-signal) ──"
+        if [[ -f "${JS_DIR}/js_secret_findings.txt" ]] && [[ $(count_lines "${JS_DIR}/js_secret_findings.txt") -gt 0 ]]; then
+            cat "${JS_DIR}/js_secret_findings.txt"
+        else
+            echo "  No JS secret findings."
+        fi
+        echo ""
+        echo "── S3 Claimable Candidates ──"
+        if [[ -f "${JS_DIR}/js_s3_claimable_candidates.txt" ]] && [[ $(count_lines "${JS_DIR}/js_s3_claimable_candidates.txt") -gt 0 ]]; then
+            cat "${JS_DIR}/js_s3_claimable_candidates.txt"
+        else
+            echo "  No claimable S3 candidates detected."
+        fi
+        echo ""
+        echo "── Safe Cache-Poisoning Risk Signals ──"
+        if [[ -f "${JS_DIR}/js_cache_poisoning_safe_report.txt" ]] && [[ $(count_lines "${JS_DIR}/js_cache_poisoning_safe_report.txt") -gt 0 ]]; then
+            cat "${JS_DIR}/js_cache_poisoning_safe_report.txt"
+        else
+            echo "  No cache-risk signals detected in safe checks."
+        fi
+        echo ""
+
+        echo "============================================================================"
         echo "  OUTPUT FILES"
         echo "============================================================================"
         echo ""
@@ -2240,7 +2617,7 @@ usage() {
     echo "      --crawl-depth N      URL crawl depth for katana/hakrawler (default: ${DEFAULT_URL_CRAWL_DEPTH})"
     echo "  -p, --ports PORTS        Comma-separated ports for naabu (default: ${DEFAULT_PORTS})"
     echo "      --top-ports N        Use naabu top-ports mode instead of port list"
-    echo "      --phase N            Run only specific phase (1-5, or 4b for SSL re-scan)"
+    echo "      --phase N            Run only specific phase (1-8, or 4b for SSL re-scan)"
     echo "      --skip-nuclei        Skip vulnerability scanning (Phase 5)"
     echo "      --nuclei-severity S  Nuclei severity filter (default: info,low,medium,high,critical)"
     echo "  -h, --help               Show this help message"
@@ -2249,6 +2626,7 @@ usage() {
     echo "  $0 -f targets.txt"
     echo "  $0 -f targets.txt -o ./results -r 100"
     echo "  $0 -f targets.txt --phase 1"
+    echo "  $0 -f targets.txt --phase 6"
     echo "  $0 -f targets.txt --enum-jobs 8 --crawl-depth 3"
     echo "  $0 -f targets.txt --skip-nuclei"
     echo "  $0 -f targets.txt --top-ports 1000"
@@ -2387,8 +2765,9 @@ main() {
     ASN_DIR="${OUTPUT_DIR}/phase3_asn"
     SSL_DIR="${OUTPUT_DIR}/phase4_ssl"
     VULN_DIR="${OUTPUT_DIR}/phase5_vulns"
+    JS_DIR="${OUTPUT_DIR}/phase6_js"
 
-    mkdir -p "$SUBS_DIR" "$DNS_DIR" "$ASN_DIR" "$SSL_DIR" "$VULN_DIR"
+    mkdir -p "$SUBS_DIR" "$DNS_DIR" "$ASN_DIR" "$SSL_DIR" "$VULN_DIR" "$JS_DIR"
 
     # Initialize logging
     log_init
@@ -2426,8 +2805,11 @@ main() {
             4)  phase4_ssl_validation ;;
             4b|4B) phase4b_rescan_ssl_discoveries ;;
             5)  phase5_vulnerability_scan ;;
+            6)  phase6_js_discovery ;;
+            7)  phase7_js_security_scan ;;
+            8)  phase8_cache_poisoning_safe ;;
             *)
-                echo -e "${CROSS} Invalid phase: ${SPECIFIC_PHASE}. Use 1-5 or 4b."
+                echo -e "${CROSS} Invalid phase: ${SPECIFIC_PHASE}. Use 1-8 or 4b."
                 exit 1
                 ;;
         esac
@@ -2443,6 +2825,9 @@ main() {
         else
             print_warning "Skipping nuclei vulnerability scan (--skip-nuclei flag)"
         fi
+        phase6_js_discovery
+        phase7_js_security_scan
+        phase8_cache_poisoning_safe
     fi
 
     # Generate report
