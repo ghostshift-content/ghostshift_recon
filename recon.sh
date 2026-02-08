@@ -261,6 +261,15 @@ OPTIONAL_TOOLS=(
     "subjs"
 )
 
+SIMPLE_REQUIRED_TOOLS=(
+    "subfinder"
+    "asnmap"
+    "naabu"
+    "httpx"
+    "jq"
+    "curl"
+)
+
 check_tools() {
     phase_banner "0" "TOOL VERIFICATION"
 
@@ -327,6 +336,55 @@ check_tools() {
         print_warning "Optional tools missing: ${missing_optional[*]} - coverage may be reduced"
     fi
 
+    return 0
+}
+
+check_tools_simple_flow() {
+    phase_banner "0" "TOOL VERIFICATION (SIMPLE FLOW)"
+
+    local missing_required=()
+    local missing_optional=()
+
+    echo -e "${BOLD}Required Tools (simple flow):${NC}"
+    for tool in "${SIMPLE_REQUIRED_TOOLS[@]}"; do
+        if command -v "$tool" &>/dev/null; then
+            local ver
+            ver=$("$tool" -version 2>/dev/null | head -1 || echo "installed")
+            echo -e "  ${CHECK} ${tool} ${CYAN}(${ver})${NC}"
+        else
+            echo -e "  ${CROSS} ${tool} ${RED}(NOT FOUND)${NC}"
+            missing_required+=("$tool")
+        fi
+    done
+
+    echo ""
+    echo -e "${BOLD}Optional Tools:${NC}"
+    for tool in "${OPTIONAL_TOOLS[@]}"; do
+        if command -v "$tool" &>/dev/null; then
+            local ver
+            ver=$("$tool" -version 2>/dev/null | head -1 || echo "installed")
+            echo -e "  ${CHECK} ${tool} ${CYAN}(${ver})${NC}"
+        else
+            echo -e "  ${WARN} ${tool} ${YELLOW}(not found - will skip)${NC}"
+            missing_optional+=("$tool")
+        fi
+    done
+
+    if [[ ${#missing_required[@]} -gt 0 ]]; then
+        print_error "Missing required tools for simple flow: ${missing_required[*]}"
+        return 1
+    fi
+
+    local httpx_help httpx_ver
+    httpx_help="$(httpx -h 2>&1 || true)"
+    httpx_ver="$(httpx -version 2>&1 || true)"
+    if ! echo "$httpx_help" | grep -Eq -- 'projectdiscovery|-sc([[:space:]]|,)|-status-code' \
+       && ! echo "$httpx_ver" | grep -qi 'projectdiscovery'; then
+        print_error "Detected non-ProjectDiscovery httpx binary."
+        return 1
+    fi
+
+    print_success "All required tools for simple flow verified"
     return 0
 }
 
@@ -2317,6 +2375,113 @@ phase8_cache_poisoning_safe() {
 }
 
 # ============================================================================
+# SIMPLE FLOW MODE
+# ============================================================================
+# Flow:
+# 1) Subdomain enum (all sources)
+# 2) Domain -> CIDR (asnmap)
+# 3) naabu on CIDRs
+# 4) Combine subdomains + discovered IPs
+# 5) Final httpx on one combined target list
+# Outputs (minimal):
+#   subdomains.txt
+#   asn_cidrs.txt
+#   naabu_results.txt
+#   final_targets.txt
+#   final_urls.txt
+# ============================================================================
+
+simple_flow_recon() {
+    phase_banner "S" "SIMPLE FLOW RECON"
+
+    # 1) Full subdomain enum using existing phase logic
+    phase1_subdomain_enumeration
+
+    # 2) Domain -> CIDR with asnmap
+    print_progress "Discovering CIDRs directly from target root domains (asnmap)..."
+    : > "${OUTPUT_DIR}/asn_cidrs.txt"
+    : > "${OUTPUT_DIR}/asn_raw.txt"
+
+    while IFS= read -r domain || [[ -n "$domain" ]]; do
+        domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+        [[ -z "$domain" || "$domain" == \#* ]] && continue
+        safe_timeout 60s asnmap -d "$domain" -silent 2>>"$LOG_FILE" \
+            | grep -Ev '^\[\*\] Enter PDCP API Key' \
+            >> "${OUTPUT_DIR}/asn_raw.txt" || true
+    done < "$TARGET_FILE"
+
+    grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' "${OUTPUT_DIR}/asn_raw.txt" 2>/dev/null \
+        | sort -u > "${OUTPUT_DIR}/asn_cidrs.txt" || touch "${OUTPUT_DIR}/asn_cidrs.txt"
+
+    local cidr_count
+    cidr_count=$(count_lines "${OUTPUT_DIR}/asn_cidrs.txt")
+    print_status "CIDRs discovered: ${cidr_count}"
+
+    # 3) naabu on all CIDRs
+    : > "${OUTPUT_DIR}/naabu_results.txt"
+    : > "${OUTPUT_DIR}/asn_ips.txt"
+    if [[ "$cidr_count" -gt 0 ]]; then
+        print_progress "Running naabu on all discovered CIDRs..."
+        if [[ -n "$NAABU_TOP_PORTS" ]]; then
+            naabu -list "${OUTPUT_DIR}/asn_cidrs.txt" \
+                -top-ports "$NAABU_TOP_PORTS" \
+                -silent \
+                -rate "$DEFAULT_NAABU_RATE" \
+                -o "${OUTPUT_DIR}/naabu_results.txt" \
+                2>>"$LOG_FILE" || true
+        else
+            naabu -list "${OUTPUT_DIR}/asn_cidrs.txt" \
+                -p "$DEFAULT_PORTS" \
+                -silent \
+                -rate "$DEFAULT_NAABU_RATE" \
+                -o "${OUTPUT_DIR}/naabu_results.txt" \
+                2>>"$LOG_FILE" || true
+        fi
+
+        cut -d':' -f1 "${OUTPUT_DIR}/naabu_results.txt" 2>/dev/null \
+            | sort -u > "${OUTPUT_DIR}/asn_ips.txt" || touch "${OUTPUT_DIR}/asn_ips.txt"
+    fi
+
+    # 4) combine subdomains + IPs
+    : > "${OUTPUT_DIR}/final_targets.txt"
+    if [[ -f "${OUTPUT_DIR}/subdomains.txt" ]]; then
+        cat "${OUTPUT_DIR}/subdomains.txt" >> "${OUTPUT_DIR}/final_targets.txt"
+    fi
+    if [[ -f "${OUTPUT_DIR}/asn_ips.txt" ]]; then
+        cat "${OUTPUT_DIR}/asn_ips.txt" >> "${OUTPUT_DIR}/final_targets.txt"
+    fi
+    sort -u -o "${OUTPUT_DIR}/final_targets.txt" "${OUTPUT_DIR}/final_targets.txt"
+    delete_empty_lines "${OUTPUT_DIR}/final_targets.txt"
+
+    # 5) final httpx on one list only
+    : > "${OUTPUT_DIR}/final_urls.txt"
+    local final_target_count
+    final_target_count=$(count_lines "${OUTPUT_DIR}/final_targets.txt")
+    if [[ "$final_target_count" -gt 0 ]]; then
+        print_progress "Final consolidated httpx run on ${final_target_count} targets..."
+        httpx -l "${OUTPUT_DIR}/final_targets.txt" \
+            -silent \
+            -threads "$DEFAULT_HTTPX_THREADS" \
+            -status-code \
+            -timeout 10 \
+            -retries 2 \
+            -follow-redirects \
+            -o "${OUTPUT_DIR}/final_urls_full.txt" \
+            2>>"$LOG_FILE" || touch "${OUTPUT_DIR}/final_urls_full.txt"
+
+        awk '{print $1}' "${OUTPUT_DIR}/final_urls_full.txt" 2>/dev/null \
+            | sort -u > "${OUTPUT_DIR}/final_urls.txt" || touch "${OUTPUT_DIR}/final_urls.txt"
+    fi
+
+    print_success "Simple flow completed"
+    print_finding "Clean subdomains: ${OUTPUT_DIR}/subdomains.txt"
+    print_finding "CIDRs: ${OUTPUT_DIR}/asn_cidrs.txt"
+    print_finding "naabu results: ${OUTPUT_DIR}/naabu_results.txt"
+    print_finding "Final targets: ${OUTPUT_DIR}/final_targets.txt"
+    print_finding "Final http/https URLs: ${OUTPUT_DIR}/final_urls.txt"
+}
+
+# ============================================================================
 # FINAL REPORT GENERATION
 # ============================================================================
 
@@ -2711,6 +2876,7 @@ usage() {
     echo "  -p, --ports PORTS        Comma-separated ports for naabu (default: ${DEFAULT_PORTS})"
     echo "      --top-ports N        Use naabu top-ports mode instead of port list"
     echo "      --phase N            Run only specific phase (1-8, or 4b/4c)"
+    echo "      --simple-flow        Run streamlined flow (subs -> cidr -> naabu -> final httpx)"
     echo "      --skip-nuclei        Skip vulnerability scanning (Phase 5)"
     echo "      --nuclei-severity S  Nuclei severity filter (default: info,low,medium,high,critical)"
     echo "      --silent             Quiet mode (suppress normal stdout; keep logs/files)"
@@ -2722,6 +2888,7 @@ usage() {
     echo "  $0 -f targets.txt --phase 1"
     echo "  $0 -f targets.txt --phase 6"
     echo "  $0 -f targets.txt --phase 4c"
+    echo "  $0 -f targets.txt --simple-flow"
     echo "  $0 -f targets.txt --enum-jobs 8 --crawl-depth 3"
     echo "  $0 -f targets.txt --skip-nuclei"
     echo "  $0 -f targets.txt --top-ports 1000"
@@ -2747,6 +2914,7 @@ main() {
     ENUM_JOBS="$DEFAULT_ENUM_JOBS"
     URL_CRAWL_DEPTH="$DEFAULT_URL_CRAWL_DEPTH"
     SPECIFIC_PHASE=""
+    SIMPLE_FLOW=false
     SKIP_NUCLEI=false
     NUCLEI_SEVERITY="info,low,medium,high,critical"
 
@@ -2791,6 +2959,10 @@ main() {
             --phase)
                 SPECIFIC_PHASE="$2"
                 shift 2
+                ;;
+            --simple-flow)
+                SIMPLE_FLOW=true
+                shift
                 ;;
             --skip-nuclei)
                 SKIP_NUCLEI=true
@@ -2886,6 +3058,7 @@ main() {
     echo -e "  Enum jobs:      ${ENUM_JOBS}"
     echo -e "  Crawl depth:    ${URL_CRAWL_DEPTH}"
     echo -e "  Ports:          ${NAABU_TOP_PORTS:+top-${NAABU_TOP_PORTS}}${NAABU_TOP_PORTS:-${DEFAULT_PORTS}}"
+    echo -e "  Simple flow:    ${SIMPLE_FLOW}"
     echo -e "  Skip nuclei:    ${SKIP_NUCLEI}"
     echo -e "  Silent mode:    ${SILENT_MODE}"
     echo ""
@@ -2896,13 +3069,20 @@ main() {
     start_time=$(date +%s)
 
     # Tool verification
-    if ! check_tools; then
+    if [[ "$SIMPLE_FLOW" == true ]]; then
+        if ! check_tools_simple_flow; then
+            echo -e "${CROSS} Cannot proceed without required tools for simple flow."
+            exit 1
+        fi
+    elif ! check_tools; then
         echo -e "${CROSS} Cannot proceed without required tools. Please install them first."
         exit 1
     fi
 
     # Run phases
-    if [[ -n "$SPECIFIC_PHASE" ]]; then
+    if [[ "$SIMPLE_FLOW" == true ]]; then
+        simple_flow_recon
+    elif [[ -n "$SPECIFIC_PHASE" ]]; then
         case "$SPECIFIC_PHASE" in
             1)  phase1_subdomain_enumeration ;;
             2)  phase2_dns_and_livehost ;;
